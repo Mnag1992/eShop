@@ -719,8 +719,22 @@ def agent_2_automate(analysis, static):
     return generated
 
 
+_BROWSERS_READY = False
+
+
+def ensure_browsers():
+    """CI runners start without Playwright browsers; install once, before the first test run."""
+    global _BROWSERS_READY
+    if _BROWSERS_READY or not os.getenv("CI"):
+        return
+    print("🌐 Installing Playwright Chromium...")
+    subprocess.run([tool("npx"), "playwright", "install", "--with-deps", "chromium"], env=clean_env())
+    _BROWSERS_READY = True
+
+
 def execute_spec(path):
     """Really run a generated spec (with the login setup); returns (ok, error output)."""
+    ensure_browsers()
     result = run([tool("npx"), "playwright", "test", path, LOGIN_SETUP, "--reporter=line", "--retries=0"],
                  env=clean_env({"ESHOP_USE_HTTP_ENDPOINTS": os.getenv("ESHOP_USE_HTTP_ENDPOINTS", "1")}))
     out = result.stdout + result.stderr
@@ -787,8 +801,7 @@ def run_e2e(selected, generated):
     env.setdefault("ESHOP_USE_HTTP_ENDPOINTS", "1")
     if os.getenv("QA_HEADED"):
         env["PW_HEADED"] = "1"
-    if os.getenv("CI"):
-        subprocess.run([npx, "playwright", "install", "--with-deps", "chromium"], env=env)
+    ensure_browsers()
     proc = subprocess.run([npx, "playwright", "test", *targets, "--reporter=line,junit,html"], env=env)
 
     rows = []
