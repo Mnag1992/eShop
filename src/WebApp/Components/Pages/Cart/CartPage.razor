@@ -94,6 +94,16 @@
                     <div>Total</div>
                     <div>$@TotalPrice?.ToPriceDisplay()</div>
                 </div>
+                <p class="cart-shipping-note" data-cart-shipping-note>
+                    @if (TotalPrice >= FreeShippingThreshold)
+                    {
+                        <span>Free shipping unlocked</span>
+                    }
+                    else
+                    {
+                        <span>Add $@((FreeShippingThreshold - TotalPrice)?.ToPriceDisplay()) more to unlock free shipping</span>
+                    }
+                </p>
                 <a href="checkout" class="button button-primary">Check out</a>
                 <a href="" class="cart-summary-link">
                     <img role="presentation" src="icons/arrow-left.svg" />
@@ -122,6 +132,9 @@
 
     private decimal? TotalPrice => basketItems?.Sum(i => i.Quantity * i.UnitPrice);
     private decimal? TotalQuantity => basketItems?.Sum(i => i.Quantity);
+
+    // Orders at or above this total ship for free; the bag shows how far away the shopper is.
+    private const decimal FreeShippingThreshold = 300m;
 
     // While an update post is in process, we want to show the pending quantity, not the one
     // that is committed to the cart (otherwise the UI briefly shows the old data)
