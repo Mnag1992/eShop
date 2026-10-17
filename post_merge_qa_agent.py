@@ -252,7 +252,7 @@ def call_llm(system_prompt, user_prompt, json_mode=False, purpose=""):
                     body = e.read().decode("utf-8", "ignore")[:300]
                     errors.append(f"{name}/{model} HTTP {e.code}: {body}")
                     if e.code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                        wait = min(30, 2 ** attempt) + random.uniform(0, 1.5)
+                        wait = (15 * attempt if e.code == 429 else min(30, 2 ** attempt)) + random.uniform(0, 1.5)
                         print(f"⚠️  {name}/{model} busy (HTTP {e.code}), retry {attempt}/{MAX_RETRIES - 1} in {wait:.1f}s")
                         time.sleep(wait)
                         continue
@@ -709,7 +709,14 @@ def agent_2_automate(analysis, static):
             f"## Storefront markup\n{markup}\n\n{catalog_block()}"
         )
         print(f"🤖 Agent 2: automating {len(group)} scenario(s) -> {path}")
-        if write_with_self_healing(path, user_prompt):
+        try:
+            written = write_with_self_healing(path, user_prompt)
+        except LLMUnavailable as e:  # keep Agent 1's analysis; never leave an unvalidated spec behind
+            print(f"⚠️  Agent 2 could not finish {path}: {e}")
+            if os.path.exists(path):
+                os.remove(path)
+            written = False
+        if written:
             generated.append(path)
             for s in group:
                 s["automated_in"] = path
