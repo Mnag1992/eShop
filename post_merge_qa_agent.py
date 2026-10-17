@@ -743,6 +743,7 @@ def write_with_self_healing(path, user_prompt):
         if attempt == MAX_HEAL_ATTEMPTS:
             break
         print(f"🩹 Agent 2: {path} failed to load, self-healing (attempt {attempt + 1}/{MAX_HEAL_ATTEMPTS})...")
+        print("----- Agent 2 error output (tail) -----\n" + errors[-2500:] + "\n---------------------------------------")
         fix_prompt = (f"{user_prompt}\n\n## Your previous code\n```ts\n{code}\n```\n\n"
                       f"## Playwright / TypeScript errors\n{errors}\n\nReturn the corrected full file.")
         code = strip_code_fences(call_llm(AGENT2_PROMPT, fix_prompt, purpose=f"Agent 2 heal {os.path.basename(path)}"))
