@@ -66,6 +66,7 @@ SRC_DIR = "src"
 E2E_DIR = "e2e"
 GENERATED_DIR = f"{E2E_DIR}/generated"   # e2e/generated/<Name>.<auth|anon>.spec.ts
 LOGIN_SETUP = f"{E2E_DIR}/login.setup.ts"
+CATALOG_JSON = f"{SRC_DIR}/Catalog.API/Setup/catalog.json"
 RESULTS_DIR = "qa-results"
 QUARANTINE_DIR = "qa-quarantine"
 REPORT_FILE = "qa-report.md"
@@ -497,6 +498,18 @@ def static_impact(changed_files, projects):
 # --------------------------------------------------------------------------- #
 # Stage 2: Agent 1 - QA Architect (scenarios + coverage mapping)
 # --------------------------------------------------------------------------- #
+def catalog_block():
+    """The seeded product catalog: the ONLY products that exist in the test environment."""
+    try:
+        with open(CATALOG_JSON, encoding="utf-8-sig") as f:
+            items = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    lines = [f"- {i['Name']} (${i['Price']})" for i in items]
+    return ("## Seeded product catalog (the ONLY products that exist; names and prices are exact)\n"
+            + "\n".join(lines))
+
+
 AGENT1_PROMPT = """
 You are Agent 1, a senior QA Architect for eShop - a .NET / Aspire reference e-commerce
 application: Blazor storefront (WebApp, WebAppComponents) backed by microservices
@@ -546,6 +559,9 @@ Return ONLY this JSON:
   ]
 }
 Rules: covered_by may only contain ids from the inventory ([] when missing).
+Test data: scenarios may only use products from the "Seeded product catalog" section, with
+their exact names and prices. Never invent a product. If a scenario needs a cart total that
+the catalog cannot produce (e.g. exactly $300.00), do not mark it automatable.
 target_spec (PascalCase, no extension) groups missing scenarios into one new spec file.
 """
 
@@ -560,6 +576,9 @@ def build_agent1_prompt(diff_text, static, inventory):
         f"- Types that use them: {static['indirectly_impacted_types'][:60]}\n"
         f"- Journeys (specs) that exercise impacted services: {static['candidate_specs']}"
     )
+    cat = catalog_block()
+    if cat:
+        parts.append(cat)
     parts.append("## Automation inventory (id -> test title)\n"
                  + "\n".join(f"- {t['id']} -> {t['title']} ({'logged in' if t['auth'] else 'anonymous'})" for t in inventory))
     changed_code = dict.fromkeys(f for files in static["changed_src_files"].values() for f in files
@@ -617,6 +636,9 @@ Hard rules:
   inside the test. Specs run serially and share the seeded user's basket: every test that
   touches the cart must start from emptyCart(page) and leave the cart empty.
 - Only use pages, texts and elements that exist in the provided markup and specs.
+- Products: use ONLY exact names from the "Seeded product catalog" section. Never invent or
+  "assume" a product. Compute expected totals from the catalog prices. If a scenario cannot be
+  built from catalog products, skip that test() instead of guessing.
 - Test titles: "<scenario id> <scenario title>".
 - Output ONLY TypeScript code, no markdown, no explanations.
 """
@@ -684,7 +706,7 @@ def agent_2_automate(analysis, static):
             f"Spec file: {path} ({'logged-in user' if auth == 'auth' else 'anonymous user'})\n\n"
             f"## QA scenarios to automate\n{json.dumps(group, indent=2)}\n\n"
             f"## Existing framework: helpers and specs\n{framework}\n\n"
-            f"## Storefront markup\n{markup}"
+            f"## Storefront markup\n{markup}\n\n{catalog_block()}"
         )
         print(f"🤖 Agent 2: automating {len(group)} scenario(s) -> {path}")
         if write_with_self_healing(path, user_prompt):
@@ -697,6 +719,14 @@ def agent_2_automate(analysis, static):
     return generated
 
 
+def execute_spec(path):
+    """Really run a generated spec (with the login setup); returns (ok, error output)."""
+    result = run([tool("npx"), "playwright", "test", path, LOGIN_SETUP, "--reporter=line", "--retries=0"],
+                 env=clean_env({"ESHOP_USE_HTTP_ENDPOINTS": os.getenv("ESHOP_USE_HTTP_ENDPOINTS", "1")}))
+    out = result.stdout + result.stderr
+    return result.returncode == 0, out[-6000:]
+
+
 def write_with_self_healing(path, user_prompt):
     code = strip_code_fences(call_llm(AGENT2_PROMPT, user_prompt, purpose=f"Agent 2 {os.path.basename(path)}"))
     os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -704,8 +734,11 @@ def write_with_self_healing(path, user_prompt):
         with open(path, "w", encoding="utf-8") as f:
             f.write(code + "\n")
         ok, errors = playwright_list(path)
+        if ok:  # loads fine - now prove it passes against the real app (catches invented data)
+            ok, errors = execute_spec(path)
+            errors = "The spec loaded but FAILED when executed against the running app:\n" + errors
         if ok:
-            print(f"✅ Agent 2: generated + validated -> {path}")
+            print(f"✅ Agent 2: generated + validated + passing -> {path}")
             return True
         if attempt == MAX_HEAL_ATTEMPTS:
             break
@@ -916,7 +949,14 @@ def main():
     selected, new_specs = select_tests(analysis, static, inventory, generated, llm_error is None)
     print("🧪 Stage 4: running affected tests only...")
     failed, results = run_e2e(selected, new_specs)
-    quarantined = quarantine_generated_tests(generated) if failed else {}
+    quarantined = {}
+    if failed and generated:
+        bad = [r for r in results if r[2] == "FAIL"]
+        only_new = bool(bad) and all("generated" in (r[0] or "") for r in bad)
+        quarantined = quarantine_generated_tests(generated)
+        if only_new:
+            print("ℹ️  Only the new tests failed; existing tests are green. New specs quarantined.")
+            failed = False
     write_report(analysis, static, inventory, selected, generated, results, failed, llm_error, quarantined)
     return 1 if failed else 0
 
