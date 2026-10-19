@@ -1,9 +1,15 @@
 """
-eShop Post-Merge Autonomous QA Pipeline
-=======================================
+Post-Merge Autonomous QA Pipeline (project-agnostic)
+====================================================
 
 Triggered when a PR is merged into main (see .github/workflows/post-merge-qa.yml).
-The automation suite is the Playwright end-to-end suite in e2e/.
+The automation suite is a Playwright (TypeScript) end-to-end suite.
+
+Everything project-specific lives in qa-agent/qa-agent.config.json (paths, journey map,
+test data, app description) and the LLM prompts in qa-agent/prompts/*.md (seeded from built-in
+defaults on the first run, then always read from the files so they can be tuned).
+Token usage and cost are written to qa-results/qa-cost-report.{md,html}. Setup for a new
+project: qa-agent/README.md.
 
 Stage 1  Ingestion         -> git diff of the merged PR, mapped onto eShop's services (src/*).
 Stage 1b Static analysis   -> deterministic blast radius (no AI):
@@ -59,51 +65,81 @@ try:
 except Exception:
     pass
 
+try:  # cost report lives in qa-agent/qa_cost.py (optional - the agent works without it)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "qa-agent"))
+    import qa_cost
+except ImportError:
+    qa_cost = None
+
 # --------------------------------------------------------------------------- #
-# Configuration (all overridable through environment variables)
+# Configuration (qa-agent/qa-agent.config.json; LLM settings via environment variables)
 # --------------------------------------------------------------------------- #
-SRC_DIR = "src"
-E2E_DIR = "e2e"
-GENERATED_DIR = f"{E2E_DIR}/generated"   # e2e/generated/<Name>.<auth|anon>.spec.ts
-LOGIN_SETUP = f"{E2E_DIR}/login.setup.ts"
-CATALOG_JSON = f"{SRC_DIR}/Catalog.API/Setup/catalog.json"
+def _load_config():
+    """Generic defaults, overridden by qa-agent/qa-agent.config.json (path: QA_CONFIG)."""
+    cfg = {
+        "project_name": os.path.basename(os.getcwd()),
+        "project_description": "a web application",
+        "suite_description": "Playwright end-to-end tests that drive the application in a browser.",
+        "src_dir": "src", "e2e_dir": "e2e", "generated_dir": "", "login_setup": "",
+        "source_extensions": [".cs", ".razor"], "shared_dir": "", "excluded_projects": [],
+        "global_files": ["playwright.config.ts", "package.json", "package-lock.json"],
+        "generic_types": ["Program", "Extensions", "GlobalUsings", "Constants", "Startup", "App", "Routes"],
+        "auth_specs": [], "all_specs": [], "spec_map": {}, "default_specs": "all", "helper_files": [],
+        "ui_markup": {"dirs": [], "extensions": [".razor"], "budget_chars": 40000},
+        "test_data": [], "prompts_dir": "qa-agent/prompts", "pricing_file": "qa-agent/pricing.json",
+        "cost": {"free_providers": ["github", "gemini"],
+                 "reference_models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"], "prs_per_month": 50},
+        "prompt_vars": {},
+    }
+    path = os.getenv("QA_CONFIG", "qa-agent/qa-agent.config.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            user = json.load(f)
+    except OSError:
+        print(f"ℹ️  No config file at {path} - using generic defaults (see qa-agent/README.md).")
+        return cfg
+    for k, v in user.items():
+        if k.startswith("_"):
+            continue
+        cfg[k] = {**cfg[k], **v} if isinstance(v, dict) and isinstance(cfg.get(k), dict) else v
+    return cfg
+
+
+CFG = _load_config()
+SRC_DIR = CFG["src_dir"]
+E2E_DIR = CFG["e2e_dir"]
+GENERATED_DIR = CFG["generated_dir"] or f"{E2E_DIR}/generated"   # <generated_dir>/<Owner>__<Name>.<auth|anon>.spec.ts
+LOGIN_SETUP = CFG["login_setup"]            # "" = the suite has no login setup project
 RESULTS_DIR = "qa-results"
 QUARANTINE_DIR = "qa-quarantine"
 REPORT_FILE = "qa-report.md"
+SOURCE_EXTS = tuple(CFG["source_extensions"])
+EXCLUDED_PROJECTS = set(CFG["excluded_projects"])
+SHARED_DIR = CFG["shared_dir"] or f"{SRC_DIR}/Shared"    # shared code linked by <Compile Include="..\Shared\X.cs">
+GLOBAL_FILES = set(CFG["global_files"])     # repo-wide build inputs: a change here can affect every journey
+GENERIC_TYPES = set(CFG["generic_types"])   # type names too generic to follow through the type graph
+AUTH_SPECS = set(CFG["auth_specs"])         # specs that run as the logged-in user (playwright.config.ts project)
+HELPER_FILES = list(CFG["helper_files"])
 
-# MAUI apps are not served by the AppHost the e2e suite runs against.
-EXCLUDED_PROJECTS = {"ClientApp", "HybridApp"}
 
-# src/Shared has no .csproj: services link its files via <Compile Include="..\Shared\X.cs">.
-SHARED_DIR = f"{SRC_DIR}/Shared"
+def _discover_specs():
+    names = []
+    for p in sorted(glob.glob(f"{E2E_DIR}/*.spec.ts")):
+        names.append(os.path.basename(p)[:-len(".spec.ts")])
+    return names
 
-# Repo-wide build inputs: a change here can affect every journey.
-GLOBAL_FILES = {"Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props",
-                "global.json", "nuget.config", "playwright.config.ts", "package.json", "package-lock.json"}
 
-# Type names too generic to follow through the type graph.
-GENERIC_TYPES = {"Program", "Extensions", "GlobalUsings", "Constants", "Startup", "App", "Routes"}
+ALL_SPECS = list(CFG["all_specs"]) or _discover_specs()
+E2E_SPEC_MAP = CFG["spec_map"]              # service/project -> user journeys (specs) that exercise it
 
-# Specs that run as the logged-in user (playwright.config.ts 'e2e tests logged in' project).
-AUTH_SPECS = {"CartTest", "CheckoutTest"}
 
-# Which user journeys exercise which service. Projects not listed reach the UI only through
-# a listed project (e.g. EventBus -> WebApp), which the project graph resolves.
-ALL_SPECS = ["BrowseItemTest", "CartTest", "CheckoutTest"]
-E2E_SPEC_MAP = {
-    "WebApp": ALL_SPECS,
-    "WebAppComponents": ALL_SPECS,
-    "eShop.AppHost": ALL_SPECS,
-    "eShop.ServiceDefaults": ALL_SPECS,
-    "Catalog.API": ALL_SPECS,
-    "Basket.API": ["CartTest", "CheckoutTest"],
-    "Identity.API": ["CartTest", "CheckoutTest"],
-    "Ordering.API": ["CheckoutTest"],
-    "Ordering.Domain": ["CheckoutTest"],
-    "Ordering.Infrastructure": ["CheckoutTest"],
-    "OrderProcessor": ["CheckoutTest"],
-    "PaymentProcessor": ["CheckoutTest"],
-}
+def specs_for(project_name):
+    """Journeys for a project; unlisted projects get default_specs ('all' = every journey, [] = none)."""
+    if project_name in E2E_SPEC_MAP:
+        return E2E_SPEC_MAP[project_name]
+    default = CFG["default_specs"]
+    return ALL_SPECS if default == "all" else list(default)
+
 
 PROVIDER_ORDER = [p.strip() for p in os.getenv("LLM_PROVIDERS", "github,gemini,anthropic").split(",") if p.strip()]
 
@@ -161,7 +197,8 @@ def _github_models(model, system_prompt, user_prompt, json_mode):
         {"Authorization": f"Bearer {token}", "Accept": "application/json"},
         payload,
     )
-    return data["choices"][0]["message"]["content"]
+    u = data.get("usage") or {}
+    return data["choices"][0]["message"]["content"], {"input": u.get("prompt_tokens", 0), "output": u.get("completion_tokens", 0)}
 
 
 def _gemini(model, system_prompt, user_prompt, json_mode):
@@ -178,7 +215,10 @@ def _gemini(model, system_prompt, user_prompt, json_mode):
             "generationConfig": gen_cfg,
         },
     )
-    return "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
+    u = data.get("usageMetadata") or {}  # Gemini bills "thinking" tokens as output
+    usage = {"input": u.get("promptTokenCount", 0),
+             "output": u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0)}
+    return "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"]), usage
 
 
 def _anthropic(model, system_prompt, user_prompt, json_mode):
@@ -198,7 +238,9 @@ def _anthropic(model, system_prompt, user_prompt, json_mode):
     )
     if data.get("stop_reason") == "refusal":
         raise ValueError("model declined the request (stop_reason=refusal)")
-    return "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
+    u = data.get("usage") or {}
+    return ("".join(b.get("text", "") for b in data["content"] if b.get("type") == "text"),
+            {"input": u.get("input_tokens", 0), "output": u.get("output_tokens", 0)})
 
 
 PROVIDERS = {
@@ -220,6 +262,7 @@ PROVIDERS = {
 }
 
 LLM_USAGE_LOG = []  # which provider/model actually answered (for the report)
+LLM_CALLS = []      # per call: purpose, provider, model, input/output tokens (for the cost report)
 DEAD_MODELS = set()  # circuit breaker: models that already failed in this run are skipped
 
 
@@ -242,10 +285,20 @@ def call_llm(system_prompt, user_prompt, json_mode=False, purpose=""):
                 continue
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    text = provider["fn"](model, system_prompt, prompt, json_mode).strip()
+                    started = time.time()
+                    text, usage = provider["fn"](model, system_prompt, prompt, json_mode)
+                    text = text.strip()
                     if not text:
                         raise ValueError("empty response")
-                    LLM_USAGE_LOG.append(f"{purpose}: {name}/{model}")
+                    call = {"purpose": purpose, "provider": name, "model": model,
+                            "input_tokens": int(usage.get("input") or 0), "output_tokens": int(usage.get("output") or 0),
+                            "seconds": round(time.time() - started, 1)}
+                    if not call["input_tokens"] and not call["output_tokens"]:  # provider sent no usage block
+                        call["input_tokens"] = (len(system_prompt) + len(prompt)) // 4
+                        call["output_tokens"] = len(text) // 4
+                        call["estimated"] = True
+                    LLM_CALLS.append(call)
+                    LLM_USAGE_LOG.append(f"{purpose}: {name}/{model} ({call['input_tokens']:,} in / {call['output_tokens']:,} out)")
                     print(f"   ↳ answered by {name}/{model}")
                     return text
                 except urllib.error.HTTPError as e:
@@ -345,6 +398,8 @@ def declared_types(path):
         return {os.path.basename(path).split(".")[0]}  # a Razor component's type is its file name
     if path.endswith(".cs"):
         return set(TYPE_DECL.findall(read(path)))
+    if path.endswith(SOURCE_EXTS):  # other languages: a file's "type" is its file name
+        return {os.path.basename(path).split(".")[0]}
     return set()
 
 
@@ -381,7 +436,7 @@ def get_post_merge_diff():
     # The diff text for the LLM only includes code that matters for impact analysis.
     diff = run(["git", "diff", base, head, "--", SRC_DIR, E2E_DIR,
                 ":(exclude)*.css", ":(exclude)*.png", ":(exclude)*.jpg", ":(exclude)*.webp",
-                ":(exclude)src/*/*.json"]).stdout
+                f":(exclude){SRC_DIR}/*/*.json"]).stdout
     return diff, files
 
 
@@ -401,6 +456,12 @@ def load_projects():
         shared = {norm(s) for s in re.findall(r'<Compile\s+Include="\.\.[\\/]Shared[\\/]([^"]+)"', text)}
         projects[name] = {"name": name, "dir": os.path.dirname(csproj), "refs": refs - EXCLUDED_PROJECTS,
                           "shared": shared}
+    if not projects:  # not a .NET layout: every top-level folder under src_dir is a component
+        for d in sorted(glob.glob(f"{SRC_DIR}/*/")):
+            d = norm(d).rstrip("/")
+            name = os.path.basename(d)
+            if name not in EXCLUDED_PROJECTS:
+                projects[name] = {"name": name, "dir": d, "refs": set(), "shared": set()}
     return projects
 
 
@@ -423,8 +484,8 @@ def owners_of(path, projects):
 
 
 def project_files(project):
-    return [norm(f) for ext in (".cs", ".razor") for f in glob.glob(f"{project['dir']}/**/*{ext}", recursive=True)
-            if "/obj/" not in norm(f) and "/bin/" not in norm(f)]
+    return [norm(f) for ext in SOURCE_EXTS for f in glob.glob(f"{project['dir']}/**/*{ext}", recursive=True)
+            if not any(x in norm(f) for x in ("/obj/", "/bin/", "/node_modules/"))]
 
 
 def static_impact(changed_files, projects):
@@ -478,7 +539,7 @@ def static_impact(changed_files, projects):
     # journey level: which existing specs exercise the impacted services
     specs = set(changed_e2e)
     for n in (projects if full_run else impacted):
-        specs.update(spec_file(s) for s in E2E_SPEC_MAP.get(n, []))
+        specs.update(spec_file(s) for s in specs_for(n))
     impacted_generated = [norm(f) for f in glob.glob(f"{GENERATED_DIR}/*.spec.ts")
                           if full_run or os.path.basename(f).split("__")[0] in impacted]
     specs.update(impacted_generated)
@@ -496,28 +557,97 @@ def static_impact(changed_files, projects):
 
 
 # --------------------------------------------------------------------------- #
+# Prompts: editable files, seeded from the built-in defaults on the first run
+# --------------------------------------------------------------------------- #
+def prompt_vars():
+    v = {
+        "project_name": CFG["project_name"], "project_description": CFG["project_description"],
+        "suite_description": CFG["suite_description"],
+        "example_step": "Perform an action in the application", "example_test_id": f"{E2E_DIR}/Example.spec.ts:4",
+        "example_page": "/", "example_paths": "'/', '/some-page'", "helpers_rules": "reuse the existing helpers from the framework section instead of re-implementing them.",
+        "auth_rules": "Authentication is handled by the Playwright project (storage state) - never log in inside the test.",
+        "app_rules": "",
+    }
+    titles = [e.get("title", "Test data") for e in CFG["test_data"]]
+    if titles:
+        t = " / ".join(f'"{x}"' for x in titles)
+        v["test_data_rules_agent1"] = (f"Test data: scenarios may only use data from the {t} section(s), exactly as listed "
+                                       "(names, prices). Never invent data. If a scenario needs a value the data cannot "
+                                       "produce, do not mark it automatable.")
+        v["test_data_rules_agent2"] = (f"- Test data: use ONLY exact values from the {t} section(s). Never invent or \"assume\" any. "
+                                       "Compute expected totals from the listed prices. If a scenario cannot be built from "
+                                       "the listed data, skip that test() instead of guessing.")
+    else:
+        v["test_data_rules_agent1"] = v["test_data_rules_agent2"] = ""
+    v.update(CFG["prompt_vars"])
+    return v
+
+
+def render_prompt(text):
+    vars_ = prompt_vars()
+    text = re.sub(r"\{\{(\w+)\}\}", lambda m: str(vars_.get(m.group(1), "")), text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+
+
+_PROMPT_CACHE = {}
+
+
+def load_prompt(name):
+    """
+    First run (or QA_REFRESH_PROMPTS=1): write the default prompt, filled in from the config, to
+    <prompts_dir>/<name>.md (an existing file is kept as <name>.md.bak). Every later run reads the file,
+    so the prompt can be tuned by editing it. <!-- html comments --> in the file are not sent to the LLM.
+    """
+    if name in _PROMPT_CACHE:
+        return _PROMPT_CACHE[name]
+    path = os.path.join(CFG["prompts_dir"], f"{name}.md")
+    refresh = bool(os.getenv("QA_REFRESH_PROMPTS"))
+    if refresh or not os.path.exists(path):
+        os.makedirs(CFG["prompts_dir"], exist_ok=True)
+        if os.path.exists(path):
+            shutil.copyfile(path, path + ".bak")
+        header = (f"<!-- {name} prompt for the post-merge QA agent. Generated from the built-in default on the first run;\n"
+                  "     from now on THIS FILE is what the agent sends to the LLM - edit it freely. Comments like this one are\n"
+                  "     removed before sending. Set QA_REFRESH_PROMPTS=1 to regenerate it from the default (old copy -> .bak). -->\n")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(header + render_prompt({"agent1": DEFAULT_AGENT1_PROMPT, "agent2": DEFAULT_AGENT2_PROMPT}[name]))
+        print(f"📝 Prompt file {'refreshed' if refresh else 'created'}: {path}")
+    text = read(path)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    _PROMPT_CACHE[name] = render_prompt(text)
+    return _PROMPT_CACHE[name]
+
+
+# --------------------------------------------------------------------------- #
 # Stage 2: Agent 1 - QA Architect (scenarios + coverage mapping)
 # --------------------------------------------------------------------------- #
 def catalog_block():
-    """The seeded product catalog: the ONLY products that exist in the test environment."""
-    try:
-        with open(CATALOG_JSON, encoding="utf-8-sig") as f:
-            items = json.load(f)
-    except (OSError, ValueError):
-        return ""
-    lines = [f"- {i['Name']} (${i['Price']})" for i in items]
-    return ("## Seeded product catalog (the ONLY products that exist; names and prices are exact)\n"
-            + "\n".join(lines))
+    """The seeded test data (config 'test_data'): the ONLY values that exist in the test environment."""
+    blocks = []
+    for entry in CFG["test_data"]:
+        try:
+            with open(entry["file"], encoding="utf-8-sig") as f:
+                items = json.load(f)
+        except (OSError, ValueError, KeyError):
+            continue
+        if isinstance(items, dict):  # {"items": [...]} style files
+            items = next((v for v in items.values() if isinstance(v, list)), [])
+        fmt = entry.get("line", "- {name}")
+        lines = []
+        for item in items:
+            try:
+                lines.append(fmt.format_map(item))
+            except (KeyError, ValueError, AttributeError, IndexError):
+                lines.append(f"- {item}")
+        note = entry.get("note", "the ONLY values that exist; names and values are exact")
+        blocks.append(f"## {entry.get('title', 'Test data')} ({note})\n" + "\n".join(lines))
+    return "\n\n".join(blocks)
 
 
-AGENT1_PROMPT = """
-You are Agent 1, a senior QA Architect for eShop - a .NET / Aspire reference e-commerce
-application: Blazor storefront (WebApp, WebAppComponents) backed by microservices
-(Catalog.API, Basket.API (gRPC + Redis), Ordering.API, Identity.API (login), Webhooks.API,
-OrderProcessor, PaymentProcessor) communicating over RabbitMQ integration events.
+DEFAULT_AGENT1_PROMPT = """
+You are Agent 1, a senior QA Architect for {{project_name}} - {{project_description}}
 
-The QA automation suite is Playwright end-to-end tests (e2e/*.spec.ts) that drive the
-storefront in a browser, either anonymously or logged in as the seeded user.
+The QA automation suite is {{suite_description}}
 
 You receive the merged PR diff, a deterministic static impact analysis, the source of the
 changed files and the full inventory of existing automated tests (with their source).
@@ -529,40 +659,38 @@ Tasks:
    boundary, regression), described as a QA engineer would: steps and expected result.
 3. For each scenario search the existing automation suite. If an existing test already
    verifies it, status = "covered" and list the test ids (exactly as given in the inventory,
-   e.g. "e2e/CartTest.spec.ts:4"). Be strict - only if the test really asserts it.
+   e.g. "{{example_test_id}}"). Be strict - only if the test really asserts it.
 4. If not covered: status = "missing", and automatable = true only if it can be verified
-   through the storefront UI with Playwright; otherwise automatable = false (manual check).
+   through the user interface with Playwright; otherwise automatable = false (manual check).
 
-Return ONLY this JSON:
+Return ONLY this JSON (do not change its shape):
 {
   "impact_summary": "2-4 sentences",
   "risk_level": "LOW|MEDIUM|HIGH",
   "blast_radius": {
-    "changed_components": ["Basket.API: BasketService"],
-    "affected_pages": ["/cart"],
+    "changed_components": ["ServiceName: ClassName"],
+    "affected_pages": ["{{example_page}}"],
     "affected_user_flows": ["add to cart", "checkout"]
   },
   "test_scenarios": [
     {
-      "id": "TC_CART_001",
+      "id": "TC_FEATURE_001",
       "title": "short title",
-      "steps": ["Open the catalog", "Add 'Adventurer GPS Watch' to the bag", "..."],
+      "steps": ["Open the application", "{{example_step}}", "..."],
       "expected": "expected result",
       "type": "positive|negative|boundary|regression",
       "priority": "P1|P2|P3",
       "logged_in": true,
       "status": "covered|missing",
-      "covered_by": ["e2e/CartTest.spec.ts:4"],
+      "covered_by": ["{{example_test_id}}"],
       "automatable": true,
-      "target_spec": "CartQuantityImpact"
+      "target_spec": "FeatureNameImpact"
     }
   ]
 }
 Rules: covered_by may only contain ids from the inventory ([] when missing).
-Test data: scenarios may only use products from the "Seeded product catalog" section, with
-their exact names and prices. Never invent a product. If a scenario needs a cart total that
-the catalog cannot produce (e.g. exactly $300.00), do not mark it automatable.
 target_spec (PascalCase, no extension) groups missing scenarios into one new spec file.
+{{test_data_rules_agent1}}
 """
 
 
@@ -582,7 +710,7 @@ def build_agent1_prompt(diff_text, static, inventory):
     parts.append("## Automation inventory (id -> test title)\n"
                  + "\n".join(f"- {t['id']} -> {t['title']} ({'logged in' if t['auth'] else 'anonymous'})" for t in inventory))
     changed_code = dict.fromkeys(f for files in static["changed_src_files"].values() for f in files
-                                 if f.endswith((".cs", ".razor", ".cshtml")) and os.path.exists(f))
+                                 if f.endswith(SOURCE_EXTS + (".cshtml",)) and os.path.exists(f))
     src_block = [f"### {f}\n```\n{read(f, 12000)}\n```" for f in changed_code]  # a shared file appears once
     parts.append("## Current source of changed files\n" + "\n".join(src_block))
     spec_files = list(dict.fromkeys(static["candidate_specs"] + sorted({t["file"] for t in inventory})))
@@ -593,7 +721,7 @@ def build_agent1_prompt(diff_text, static, inventory):
 
 def agent_1_generate_scenarios(diff_text, static, inventory):
     prompt = build_agent1_prompt(diff_text, static, inventory)
-    analysis = parse_json(call_llm(AGENT1_PROMPT, prompt, json_mode=True, purpose="Agent 1"))
+    analysis = parse_json(call_llm(load_prompt("agent1"), prompt, json_mode=True, purpose="Agent 1"))
     known = {t["id"] for t in inventory}
     for s in analysis.get("test_scenarios", []):
         refs = s.get("covered_by") or []
@@ -619,26 +747,21 @@ def rule_based_scenarios(static):
 # --------------------------------------------------------------------------- #
 # Stage 3: Agent 2 - Test Automation Engineer (Playwright, self-healing)
 # --------------------------------------------------------------------------- #
-AGENT2_PROMPT = """
-You are Agent 2, a senior test automation engineer extending eShop's existing Playwright
+DEFAULT_AGENT2_PROMPT = """
+You are Agent 2, a senior test automation engineer extending {{project_name}}'s existing Playwright
 (TypeScript) end-to-end suite. Automate ALL given QA scenarios in ONE spec file
 (one test() per scenario) so it fits seamlessly into the existing framework.
 
 Hard rules:
-- import { test, expect } from '@playwright/test'; reuse the existing helpers from
-  '../cart-helpers' (addProductToCart, emptyCart, removeFirstCartItem) instead of
-  re-implementing them. Imports are relative to e2e/generated/.
-- baseURL is configured: navigate with relative paths ('/', '/cart', '/item/1').
+- import { test, expect } from '@playwright/test'; {{helpers_rules}}
+- baseURL is configured: navigate with relative paths ({{example_paths}}).
 - Follow the existing specs' style: role/label/text locators (getByRole, getByText,
   getByLabel), data-* attributes that already exist in the markup, await every expect,
   { timeout: 15_000 } for assertions that wait on a server round-trip.
-- Authentication is handled by the Playwright project (storage state) - never log in
-  inside the test. Specs run serially and share the seeded user's basket: every test that
-  touches the cart must start from emptyCart(page) and leave the cart empty.
+- {{auth_rules}}
 - Only use pages, texts and elements that exist in the provided markup and specs.
-- Products: use ONLY exact names from the "Seeded product catalog" section. Never invent or
-  "assume" a product. Compute expected totals from the catalog prices. If a scenario cannot be
-  built from catalog products, skip that test() instead of guessing.
+{{test_data_rules_agent2}}
+{{app_rules}}
 - Test titles: "<scenario id> <scenario title>".
 - Output ONLY TypeScript code, no markdown, no explanations.
 """
@@ -667,16 +790,19 @@ def unique_path(name, suffix):
 
 
 def ui_markup(static):
-    """Storefront markup Agent 2 can pick locators from: changed .razor files first, then pages."""
-    files = [f for fs in static["changed_src_files"].values() for f in fs if f.endswith(".razor")]
-    for d in ("src/WebApp/Components/Pages", "src/WebApp/Components/Layout", "src/WebAppComponents"):
-        files += sorted(norm(f) for f in glob.glob(f"{d}/**/*.razor", recursive=True))
-    blocks, budget = [], 40000
+    """UI markup Agent 2 can pick locators from: changed UI files first, then the configured pages."""
+    ui = CFG["ui_markup"]
+    exts = tuple(ui.get("extensions", [".razor"]))
+    files = [f for fs in static["changed_src_files"].values() for f in fs if f.endswith(exts)]
+    for d in ui.get("dirs", []):
+        for ext in exts:
+            files += sorted(norm(f) for f in glob.glob(f"{d}/**/*{ext}", recursive=True))
+    blocks, budget = [], ui.get("budget_chars", 40000)
     for f in dict.fromkeys(files):
         if os.path.exists(f) and budget > 0:
             text = read(f, 6000)
             budget -= len(text)
-            blocks.append(f"### {f}\n```razor\n{text}\n```")
+            blocks.append(f"### {f}\n```markup\n{text}\n```")
     return "\n".join(blocks)
 
 
@@ -697,7 +823,7 @@ def agent_2_automate(analysis, static):
         groups.setdefault(key, []).append(s)
 
     framework = "\n".join(f"### {f}\n```ts\n{read(f, 5000)}\n```"
-                          for f in [f"{E2E_DIR}/cart-helpers.ts", *(spec_file(s) for s in ALL_SPECS)] if os.path.exists(f))
+                          for f in [*HELPER_FILES, *(spec_file(s) for s in ALL_SPECS)] if os.path.exists(f))
     markup = ui_markup(static)
     generated = []
     for (name, auth), group in groups.items():
@@ -742,14 +868,14 @@ def ensure_browsers():
 def execute_spec(path):
     """Really run a generated spec (with the login setup); returns (ok, error output)."""
     ensure_browsers()
-    result = run([tool("npx"), "playwright", "test", path, LOGIN_SETUP, "--reporter=line", "--retries=0"],
+    result = run([tool("npx"), "playwright", "test", path, *([LOGIN_SETUP] if LOGIN_SETUP else []), "--reporter=line", "--retries=0"],
                  env=clean_env({"ESHOP_USE_HTTP_ENDPOINTS": os.getenv("ESHOP_USE_HTTP_ENDPOINTS", "1")}))
     out = result.stdout + result.stderr
     return result.returncode == 0, out[-6000:]
 
 
 def write_with_self_healing(path, user_prompt):
-    code = strip_code_fences(call_llm(AGENT2_PROMPT, user_prompt, purpose=f"Agent 2 {os.path.basename(path)}"))
+    code = strip_code_fences(call_llm(load_prompt("agent2"), user_prompt, purpose=f"Agent 2 {os.path.basename(path)}"))
     os.makedirs(GENERATED_DIR, exist_ok=True)
     for attempt in range(MAX_HEAL_ATTEMPTS + 1):
         with open(path, "w", encoding="utf-8") as f:
@@ -767,7 +893,7 @@ def write_with_self_healing(path, user_prompt):
         print("----- Agent 2 error output (tail) -----\n" + errors[-2500:] + "\n---------------------------------------")
         fix_prompt = (f"{user_prompt}\n\n## Your previous code\n```ts\n{code}\n```\n\n"
                       f"## Playwright / TypeScript errors\n{errors}\n\nReturn the corrected full file.")
-        code = strip_code_fences(call_llm(AGENT2_PROMPT, fix_prompt, purpose=f"Agent 2 heal {os.path.basename(path)}"))
+        code = strip_code_fences(call_llm(load_prompt("agent2"), fix_prompt, purpose=f"Agent 2 heal {os.path.basename(path)}"))
     print(f"❌ Agent 2: {path} still invalid - discarded.")
     os.remove(path)
     return False
@@ -795,7 +921,7 @@ def run_e2e(selected, generated):
     if not targets:
         print("ℹ️  No affected automated tests to execute.")
         return False, []
-    if any(t["auth"] for t in selected) or any(".auth." in g for g in generated):
+    if LOGIN_SETUP and (any(t["auth"] for t in selected) or any(".auth." in g for g in generated)):
         targets.append(LOGIN_SETUP)  # logged-in project depends on the login setup
     print(f"🎭 Executing affected tests: {', '.join(targets)}")
     npx = tool("npx")
@@ -919,6 +1045,12 @@ def write_report(analysis, static, inventory, selected, generated, results, fail
         ]
         for path, code in quarantined.items():
             lines += [f"<details><summary>{path}</summary>", "", "```ts", code.rstrip(), "```", "", "</details>", ""]
+    if qa_cost:
+        pricing = qa_cost.load_pricing(CFG["pricing_file"])
+        cost_cfg = CFG["cost"]
+        lines += [qa_cost.render_markdown(qa_cost.summarize(
+            LLM_CALLS, pricing, cost_cfg.get("free_providers"), cost_cfg.get("reference_models"),
+            cost_cfg.get("prs_per_month", 50)))]
     lines += ["## LLM usage", *(f"- {u}" for u in LLM_USAGE_LOG or ["none"])]
     if llm_error:
         lines += ["", f"> ⚠️ LLM fallback used: {llm_error.splitlines()[0]}"]
@@ -979,6 +1111,9 @@ def main():
             print("ℹ️  Only the new tests failed; existing tests are green. New specs quarantined.")
             failed = False
     write_report(analysis, static, inventory, selected, generated, results, failed, llm_error, quarantined)
+    if qa_cost:
+        qa_cost.write_reports(LLM_CALLS, RESULTS_DIR, CFG["pricing_file"], CFG["cost"])
+        print(f"💰 Cost report: {RESULTS_DIR}/qa-cost-report.md (+ .html)")
     return 1 if failed else 0
 
 
