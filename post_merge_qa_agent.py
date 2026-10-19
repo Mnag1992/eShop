@@ -1043,6 +1043,16 @@ def select_tests(analysis, static, inventory, generated, llm_ok):
     """
     if llm_ok:
         ids = {r for s in analysis.get("test_scenarios", []) for r in s.get("covered_by", [])}
+        # regression guard: also run existing tests that open a page this change affects (e.g. goto('/cart'))
+        pages = set()
+        for p in analysis.get("blast_radius", {}).get("affected_pages", []):
+            pages.update(re.findall(r"/[A-Za-z][\w\-/]*", str(p)))
+        for t in inventory:
+            if t["id"] in ids or t["file"] not in static["candidate_specs"]:
+                continue
+            body = read(t["file"])
+            if any(re.search(r"goto\(\s*['\"`]" + re.escape(pg) + r"['\"`?/]", body) for pg in pages):
+                ids.add(t["id"])
         selected = [t for t in inventory if t["id"] in ids]
     else:
         selected = [t for t in inventory if t["file"] in static["candidate_specs"]]
