@@ -796,14 +796,16 @@ def ui_markup(static):
     """UI markup Agent 2 can pick locators from: changed UI files first, then the configured pages."""
     ui = CFG["ui_markup"]
     exts = tuple(ui.get("extensions", [".razor"]))
-    files = [f for fs in static["changed_src_files"].values() for f in fs if f.endswith(exts)]
+    changed = [f for fs in static["changed_src_files"].values() for f in fs if f.endswith(exts)]
+    files = list(changed)
     for d in ui.get("dirs", []):
         for ext in exts:
             files += sorted(norm(f) for f in glob.glob(f"{d}/**/*{ext}", recursive=True))
-    blocks, budget = [], ui.get("budget_chars", 40000)
+    blocks, budget = [], ui.get("budget_chars", 40000) + len(changed) * ui.get("changed_file_chars", 30000)
     for f in dict.fromkeys(files):
         if os.path.exists(f) and budget > 0:
-            text = read(f, 6000)
+            # files changed by the PR are shown in full - the new element is often near the end of the page
+            text = read(f, ui.get("changed_file_chars", 30000) if f in changed else ui.get("other_file_chars", 6000))
             budget -= len(text)
             blocks.append(f"### {f}\n```markup\n{text}\n```")
     return "\n".join(blocks)
