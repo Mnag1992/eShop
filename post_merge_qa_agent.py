@@ -51,6 +51,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -86,7 +87,7 @@ def _load_config():
         "generic_types": ["Program", "Extensions", "GlobalUsings", "Constants", "Startup", "App", "Routes"],
         "auth_specs": [], "all_specs": [], "spec_map": {}, "default_specs": "all", "helper_files": [],
         "ui_markup": {"dirs": [], "extensions": [".razor"], "budget_chars": 40000},
-        "test_data": [], "prompts_dir": "qa-agent/prompts", "pricing_file": "qa-agent/pricing.json",
+        "app_port": 0, "test_data": [], "prompts_dir": "qa-agent/prompts", "pricing_file": "qa-agent/pricing.json",
         "cost": {"free_providers": ["github", "gemini"],
                  "reference_models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"], "prs_per_month": 50},
         "prompt_vars": {},
@@ -120,6 +121,7 @@ GLOBAL_FILES = set(CFG["global_files"])     # repo-wide build inputs: a change h
 GENERIC_TYPES = set(CFG["generic_types"])   # type names too generic to follow through the type graph
 AUTH_SPECS = set(CFG["auth_specs"])         # specs that run as the logged-in user (playwright.config.ts project)
 HELPER_FILES = list(CFG["helper_files"])
+APP_PORT = int(CFG["app_port"] or 0)        # port the Playwright webServer listens on (0 = do not manage it)
 
 
 def _discover_specs():
@@ -845,9 +847,14 @@ def agent_2_automate(analysis, static):
             written, dropped = False, []
         if written:
             generated.append(path)
+            active = {title_key(m.group(2)) for line in read(path).splitlines() for m in [TEST_DECL.match(line)] if m}
+            dropped_keys = {title_key(t) for t in dropped}
             for s in group:
-                if any(str(s.get("id")) in t for t in dropped):
+                sid = str(s.get("id"))
+                if sid in dropped_keys:
                     s["note"] = "test failed when executed against the app - needs manual automation or review"
+                elif sid not in active:
+                    s["note"] = "Agent 2 skipped this scenario (cannot be built from the available markup/test data) - manual check"
                 else:
                     s["automated_in"] = path
         else:
@@ -857,6 +864,45 @@ def agent_2_automate(analysis, static):
 
 
 _BROWSERS_READY = False
+
+
+def _port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_port_free(port=None, wait=90):
+    """
+    Playwright starts the app itself (webServer). If an earlier run left it behind, the next start fails with
+    "http://localhost:<port> is already used" and NO test runs. Wait for a clean shutdown, then kill the listener.
+    """
+    port = port or APP_PORT
+    if not port or not _port_open(port):
+        return
+    print(f"⏳ Port {port} is still in use by a previous run - waiting up to {wait}s for it to exit...")
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(3)
+        if not _port_open(port):
+            return
+    print(f"🧹 Port {port} still busy - stopping whatever listens on it")
+    for cmd in (["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"], ["fuser", f"{port}/tcp"]):
+        if shutil.which(cmd[0]):
+            pids = re.findall(r"\d+", run(cmd).stdout)
+            for pid in pids:
+                try:
+                    os.kill(int(pid), 9)
+                except (OSError, ValueError):
+                    pass
+            break
+    for _ in range(20):
+        if not _port_open(port):
+            return
+        time.sleep(1)
+    print(f"⚠️  Port {port} is still in use - the next Playwright start may fail")
 
 
 def ensure_browsers():
@@ -875,6 +921,7 @@ def execute_spec(path):
     Returns (ok, error output, titles of the tests that failed).
     """
     ensure_browsers()
+    ensure_port_free()
     os.makedirs(RESULTS_DIR, exist_ok=True)
     report = os.path.abspath(os.path.join(RESULTS_DIR, "heal-run.json"))
     if os.path.exists(report):
@@ -884,6 +931,7 @@ def execute_spec(path):
                  env=clean_env({"ESHOP_USE_HTTP_ENDPOINTS": os.getenv("ESHOP_USE_HTTP_ENDPOINTS", "1"),
                                 "PLAYWRIGHT_JSON_OUTPUT_NAME": report}))
     out = result.stdout + result.stderr
+    ensure_port_free()  # the app must be gone before the next Playwright start
     failed = []
     try:
         def walk(suite):
@@ -901,6 +949,12 @@ def execute_spec(path):
 
 
 TEST_START = re.compile(r"^test(?:\.\w+)?\(\s*(['\"`])(.+?)\1")
+
+
+def title_key(title):
+    """Scenario id = first word of a test title (e.g. 'TC_CART_001'); robust against quote escaping."""
+    parts = (title or "").split()
+    return parts[0] if parts else ""
 
 
 def split_tests(code):
@@ -922,13 +976,14 @@ def salvage_passing_tests(code, failed_titles):
     if not parts or not failed_titles:
         return None
     header, blocks = parts
-    titles = [t for t, _ in blocks]
-    if not set(failed_titles) <= set(titles):  # a failure outside our tests (e.g. the login setup)
+    failed_keys = {title_key(t) for t in failed_titles}
+    block_keys = {title_key(t) for t, _ in blocks}
+    if not failed_keys <= block_keys:  # a failure outside our tests (e.g. the login setup)
         return None
-    kept = [b for t, b in blocks if t not in failed_titles]
+    kept = [b for t, b in blocks if title_key(t) not in failed_keys]
     if not kept:
         return None
-    return header + "\n" + "\n".join(kept), [t for t in titles if t in failed_titles]
+    return header + "\n" + "\n".join(kept), [t for t, _ in blocks if title_key(t) in failed_keys]
 
 
 def write_with_self_healing(path, user_prompt):
@@ -1011,7 +1066,13 @@ def run_e2e(selected, generated):
     if os.getenv("QA_HEADED"):
         env["PW_HEADED"] = "1"
     ensure_browsers()
-    proc = subprocess.run([npx, "playwright", "test", *targets, "--reporter=line,junit,html"], env=env)
+    for attempt in (1, 2):
+        ensure_port_free()
+        proc = subprocess.run([npx, "playwright", "test", *targets, "--reporter=line,junit,html"], env=env)
+        if proc.returncode == 0 or os.path.exists(junit) or attempt == 2:
+            break  # passed, or tests really ran and failed
+        print("⚠️  Playwright exited before producing any results (app start-up problem?) - retrying once in 30s...")
+        time.sleep(30)
 
     rows = []
     if os.path.exists(junit):

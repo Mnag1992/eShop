@@ -2,6 +2,7 @@
   "_comment": "Project settings for the post-merge QA agent. Everything project-specific lives here so the script itself stays generic. See qa-agent/README.md.",
 
   "project_name": "eShop",
+  "app_port": 5045,
   "project_description": ".NET / Aspire reference e-commerce application: Blazor storefront (WebApp, WebAppComponents) backed by microservices (Catalog.API, Basket.API (gRPC + Redis), Ordering.API, Identity.API (login), Webhooks.API, OrderProcessor, PaymentProcessor) communicating over RabbitMQ integration events.",
   "suite_description": "Playwright end-to-end tests (e2e/*.spec.ts) that drive the storefront in a browser, either anonymously or logged in as the seeded user.",
 
