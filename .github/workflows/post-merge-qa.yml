@@ -124,11 +124,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMIT_MODE: ${{ vars.QA_COMMIT_MODE || 'pr' }}
+          QA_GENERATED_DIR: e2e/generated   # must match "generated_dir" in qa-agent/qa-agent.config.json
           SOURCE_PR: ${{ github.event.pull_request.number }}
         run: |
           git config --global user.name "AI-QA-Agent[bot]"
           git config --global user.email "ai-qa-agent@users.noreply.github.com"
-          [ -d e2e/generated ] && git add e2e/generated
+          # generated tests + the prompt files the agent seeds on its first run (qa-agent/prompts)
+          [ -d "$QA_GENERATED_DIR" ] && git add "$QA_GENERATED_DIR"
+          [ -d qa-agent/prompts ] && git add qa-agent/prompts
           if git diff --staged --quiet; then
             echo "No new tests generated."
             exit 0
