@@ -61,7 +61,7 @@
                                 <input class="quantity-value" type="number" min="1" inputmode="numeric"
                                        value="@quantity" aria-label="Quantity of @item.ProductName" data-cart-quantity-input />
                                 <button type="submit" class="quantity-step" name="UpdateQuantityValue" value="@(quantity + 1)"
-                                        aria-label="Increase quantity of @item.ProductName">
+                                        aria-label="Increase quantity of @item.ProductName" disabled="@(quantity >= MaxQuantityPerItem)">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
                                 </button>
                             </div>
@@ -105,6 +105,8 @@
                     }
                 </p>
                 <p class="cart-item-count" data-cart-item-count>@ItemCountLabel</p>
+                <p class="cart-product-count" data-cart-product-count>@ProductCountLabel</p>
+                <p class="cart-max-note" data-cart-max-note>Maximum @MaxQuantityPerItem per item</p>
                 <a href="checkout" class="button button-primary">Check out</a>
                 <a href="" class="cart-summary-link">
                     <img role="presentation" src="icons/arrow-left.svg" />
@@ -134,22 +136,29 @@
     private decimal? TotalPrice => basketItems?.Sum(i => i.Quantity * i.UnitPrice);
     private decimal? TotalQuantity => basketItems?.Sum(i => i.Quantity);
 
-    private string ItemCountLabel => TotalQuantity == 1 ? "1 item in your bag" : $"{TotalQuantity} items in your bag";
-
     // Orders at or above this total ship for free; the bag shows how far away the shopper is.
     private const decimal FreeShippingThreshold = 300m;
+
+    // "1 item in your bag" / "3 items in your bag" - singular only for exactly one item.
+    private string ItemCountLabel => TotalQuantity == 1 ? "1 item in your bag" : $"{TotalQuantity} items in your bag";
+
+    // Distinct products in the bag, independent of their quantities.
+    private string ProductCountLabel => basketItems?.Count == 1 ? "1 product" : $"{basketItems?.Count ?? 0} products";
+
+    // A single product can be bought at most this many times per order; larger quantities are capped.
+    private const int MaxQuantityPerItem = 10;
 
     // While an update post is in process, we want to show the pending quantity, not the one
     // that is committed to the cart (otherwise the UI briefly shows the old data)
     private int CurrentOrPendingQuantity(int productId, int cartQuantity)
         => UpdateQuantityId.GetValueOrDefault(-1) == productId
-        ? UpdateQuantityValue!.Value
+        ? Math.Min(UpdateQuantityValue!.Value, MaxQuantityPerItem)
         : cartQuantity;
 
     private async Task UpdateQuantityAsync()
     {
         var id = UpdateQuantityId!.Value;
-        var quantity = UpdateQuantityValue!.Value;
+        var quantity = Math.Min(UpdateQuantityValue!.Value, MaxQuantityPerItem);
         await Basket.SetQuantityAsync(id, quantity);
         basketItems = await Basket.GetBasketItemsAsync();
     }
