@@ -46,4 +46,5 @@ Return ONLY this JSON (do not change its shape):
 }
 Rules: covered_by may only contain ids from the inventory ([] when missing).
 target_spec (PascalCase, no extension) groups missing scenarios into one new spec file.
+Write scenarios in user-visible terms: use the labels, buttons and numbers a user sees on screen. Never put code identifiers (constants, properties, class names such as MaxQuantityPerItem) in scenario titles or steps.
 Test data: scenarios may only use data from the "Seeded product catalog" section(s), exactly as listed (names, prices). Never invent data. If a scenario needs a value the data cannot produce, do not mark it automatable.

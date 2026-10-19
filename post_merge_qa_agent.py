@@ -690,6 +690,7 @@ Return ONLY this JSON (do not change its shape):
 }
 Rules: covered_by may only contain ids from the inventory ([] when missing).
 target_spec (PascalCase, no extension) groups missing scenarios into one new spec file.
+Write scenarios in user-visible terms: use the labels, buttons and numbers a user sees on screen. Never put code identifiers (constants, properties, class names such as MaxQuantityPerItem) in scenario titles or steps.
 {{test_data_rules_agent1}}
 """
 
@@ -836,16 +837,19 @@ def agent_2_automate(analysis, static):
         )
         print(f"🤖 Agent 2: automating {len(group)} scenario(s) -> {path}")
         try:
-            written = write_with_self_healing(path, user_prompt)
+            written, dropped = write_with_self_healing(path, user_prompt)
         except LLMUnavailable as e:  # keep Agent 1's analysis; never leave an unvalidated spec behind
             print(f"⚠️  Agent 2 could not finish {path}: {e}")
             if os.path.exists(path):
                 os.remove(path)
-            written = False
+            written, dropped = False, []
         if written:
             generated.append(path)
             for s in group:
-                s["automated_in"] = path
+                if any(str(s.get("id")) in t for t in dropped):
+                    s["note"] = "test failed when executed against the app - needs manual automation or review"
+                else:
+                    s["automated_in"] = path
         else:
             for s in group:
                 s["note"] = "automation attempt failed validation - needs manual automation"
@@ -866,37 +870,109 @@ def ensure_browsers():
 
 
 def execute_spec(path):
-    """Really run a generated spec (with the login setup); returns (ok, error output)."""
+    """
+    Really run a generated spec (with the login setup).
+    Returns (ok, error output, titles of the tests that failed).
+    """
     ensure_browsers()
-    result = run([tool("npx"), "playwright", "test", path, *([LOGIN_SETUP] if LOGIN_SETUP else []), "--reporter=line", "--retries=0"],
-                 env=clean_env({"ESHOP_USE_HTTP_ENDPOINTS": os.getenv("ESHOP_USE_HTTP_ENDPOINTS", "1")}))
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    report = os.path.abspath(os.path.join(RESULTS_DIR, "heal-run.json"))
+    if os.path.exists(report):
+        os.remove(report)
+    result = run([tool("npx"), "playwright", "test", path, *([LOGIN_SETUP] if LOGIN_SETUP else []),
+                  "--reporter=line,json", "--retries=0"],
+                 env=clean_env({"ESHOP_USE_HTTP_ENDPOINTS": os.getenv("ESHOP_USE_HTTP_ENDPOINTS", "1"),
+                                "PLAYWRIGHT_JSON_OUTPUT_NAME": report}))
     out = result.stdout + result.stderr
-    return result.returncode == 0, out[-6000:]
+    failed = []
+    try:
+        def walk(suite):
+            for sp in suite.get("specs", []):
+                if not sp.get("ok", True):
+                    failed.append(sp.get("title", ""))
+            for child in suite.get("suites", []):
+                walk(child)
+        with open(report, encoding="utf-8") as f:
+            for suite in json.load(f).get("suites", []):
+                walk(suite)
+    except (OSError, ValueError):
+        pass
+    return result.returncode == 0, out[-6000:], failed
+
+
+TEST_START = re.compile(r"^test(?:\.\w+)?\(\s*(['\"`])(.+?)\1")
+
+
+def split_tests(code):
+    """Split a spec into (header, [(title, block)]) at its top-level test() calls; None if the layout is unusual."""
+    lines = code.split("\n")
+    starts = [i for i, l in enumerate(lines) if TEST_START.match(l)]
+    if not starts or re.search(r"^\s*test\.describe", code, re.M):
+        return None
+    blocks = []
+    for n, i in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        blocks.append((TEST_START.match(lines[i]).group(2), "\n".join(lines[i:end])))
+    return "\n".join(lines[:starts[0]]), blocks
+
+
+def salvage_passing_tests(code, failed_titles):
+    """Drop the failing test() blocks and keep the passing ones. Returns (code, dropped titles) or None."""
+    parts = split_tests(code)
+    if not parts or not failed_titles:
+        return None
+    header, blocks = parts
+    titles = [t for t, _ in blocks]
+    if not set(failed_titles) <= set(titles):  # a failure outside our tests (e.g. the login setup)
+        return None
+    kept = [b for t, b in blocks if t not in failed_titles]
+    if not kept:
+        return None
+    return header + "\n" + "\n".join(kept), [t for t in titles if t in failed_titles]
 
 
 def write_with_self_healing(path, user_prompt):
+    """Returns (kept, dropped titles). kept=False means the whole spec was discarded."""
     code = strip_code_fences(call_llm(load_prompt("agent2"), user_prompt, purpose=f"Agent 2 {os.path.basename(path)}"))
     os.makedirs(GENERATED_DIR, exist_ok=True)
+    failed_titles = []
     for attempt in range(MAX_HEAL_ATTEMPTS + 1):
         with open(path, "w", encoding="utf-8") as f:
             f.write(code + "\n")
         ok, errors = playwright_list(path)
+        failed_titles = []
         if ok:  # loads fine - now prove it passes against the real app (catches invented data)
-            ok, errors = execute_spec(path)
+            ok, errors, failed_titles = execute_spec(path)
             errors = "The spec loaded but FAILED when executed against the running app:\n" + errors
         if ok:
             print(f"✅ Agent 2: generated + validated + passing -> {path}")
-            return True
+            return True, []
         if attempt == MAX_HEAL_ATTEMPTS:
             break
         print(f"🩹 Agent 2: {path} failed to load, self-healing (attempt {attempt + 1}/{MAX_HEAL_ATTEMPTS})...")
         print("----- Agent 2 error output (tail) -----\n" + errors[-2500:] + "\n---------------------------------------")
+        keep_note = (f"\nThese tests FAILED: {failed_titles}. Tests that are not listed passed - keep them unchanged "
+                     "and fix only the failing ones.\n" if failed_titles else "")
         fix_prompt = (f"{user_prompt}\n\n## Your previous code\n```ts\n{code}\n```\n\n"
-                      f"## Playwright / TypeScript errors\n{errors}\n\nReturn the corrected full file.")
+                      f"## Playwright / TypeScript errors\n{errors}\n{keep_note}\nReturn the corrected full file.")
         code = strip_code_fences(call_llm(load_prompt("agent2"), fix_prompt, purpose=f"Agent 2 heal {os.path.basename(path)}"))
+
+    # still failing: keep the tests that pass, drop only the ones that do not
+    salvaged = salvage_passing_tests(code, failed_titles)
+    if salvaged:
+        kept_code, dropped = salvaged
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(kept_code + "\n")
+        ok, _ = playwright_list(path)
+        if ok:
+            ok, _, _ = execute_spec(path)
+        if ok:
+            print(f"✅ Agent 2: kept the passing tests, dropped {len(dropped)} failing: {', '.join(dropped)}")
+            return True, dropped
     print(f"❌ Agent 2: {path} still invalid - discarded.")
-    os.remove(path)
-    return False
+    if os.path.exists(path):
+        os.remove(path)
+    return False, []
 
 
 # --------------------------------------------------------------------------- #
