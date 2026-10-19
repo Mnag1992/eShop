@@ -151,3 +151,39 @@ jobs:
               --body "Tests generated and validated by the post-merge QA agent${SOURCE_PR:+ for #$SOURCE_PR}. Please review before merging. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
               || echo "::warning::Could not open a PR automatically (enable 'Allow GitHub Actions to create and approve pull requests' in the repository settings). The tests are on branch $BRANCH."
           fi
+
+      # A red run (an existing test failed) still produces a PR - as a DRAFT - so the QA team can decide.
+      # The agent holds those specs in qa-quarantine/ instead of e2e/generated/; this step opens them for review.
+      # The PR description is the "Needs your decision" text from the report. Never merge it automatically.
+      - name: Open draft PR for held-back automation
+        if: always() && hashFiles('qa-quarantine/*.spec.ts') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QA_GENERATED_DIR: e2e/generated   # must match "generated_dir" in qa-agent/qa-agent.config.json
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+        run: |
+          git config --global user.name "AI-QA-Agent[bot]"
+          git config --global user.email "ai-qa-agent@users.noreply.github.com"
+          BRANCH="qa-agent/held-${GITHUB_RUN_ID}"
+          git fetch --no-tags origin main
+          git checkout -b "$BRANCH" origin/main
+          mkdir -p "$QA_GENERATED_DIR"
+          cp qa-quarantine/*.spec.ts "$QA_GENERATED_DIR"/
+          git add "$QA_GENERATED_DIR"
+          if git diff --staged --quiet; then
+            echo "Nothing to open."
+            exit 0
+          fi
+          git commit -m "chore(qa): held-back automation (run was red) - needs review"
+          git push origin "$BRANCH"
+          {
+            echo "**Draft - do not merge until the decision below is resolved.**"
+            echo
+            [ -s qa-results/decision.md ] && cat qa-results/decision.md
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > qa-draft-body.md
+          gh pr create --draft --base main --head "$BRANCH" \
+            --title "QA agent (needs review): held-back tests${SOURCE_PR:+ (from #$SOURCE_PR)}" \
+            --body-file qa-draft-body.md \
+            || echo "::warning::Could not open a PR automatically (enable 'Allow GitHub Actions to create and approve pull requests'). The tests are on branch $BRANCH."

@@ -1118,7 +1118,49 @@ def quarantine_generated_tests(generated):
     return held
 
 
-def write_report(analysis, static, inventory, selected, generated, results, failed, llm_error, quarantined):
+DECISION_FILE = os.path.join(RESULTS_DIR, "decision.md")
+
+
+def build_decision(results, generated, quarantined):
+    """The 'Needs your decision' text: what failed, what it probably means, what the agent did NOT do."""
+    bad = [r for r in results if r[2] == "FAIL"]
+    if not bad:
+        return ""
+    new_fail = [r for r in bad if "generated" in (r[0] or "")]
+    old_fail = [r for r in bad if "generated" not in (r[0] or "") and r[0] != "login.setup.ts"]
+    setup_fail = [r for r in bad if r[0] == "login.setup.ts"]
+    first = lambda r: (r[4] or "").strip().splitlines()[0][:200] if (r[4] or "").strip() else "see the Playwright report"
+    out = ["## ⚠️ Needs your decision", ""]
+    if setup_fail:
+        out += ["- **Login setup failed**, so no browser test could run. This points to the environment "
+                "(app did not start, seeded user missing, or the login page changed) rather than to a single test.", ""]
+    if old_fail:
+        out += ["**Existing test(s) failed after this change:**", ""]
+        out += [f"- `{r[0]}` - {r[1]}: {first(r)}" for r in old_fail]
+        out += ["",
+                "This is one of two things, and the agent cannot tell which:",
+                "1. **A regression** in the merged change - fix the application.",
+                "2. **A test the change made out of date** (e.g. a locator that now matches more than one element) - "
+                "update the test.",
+                "",
+                "The agent never edits existing tests and never decides this for you."]
+    if new_fail and not old_fail:
+        out += ["**Only the newly generated test(s) failed; the existing tests are green:**", ""]
+        out += [f"- `{r[0]}` - {r[1]}: {first(r)}" for r in new_fail]
+        out += ["", "The merged change is probably fine; the generated test is probably wrong or flaky."]
+    if quarantined:
+        out += ["", f"**{len(quarantined)} generated spec(s) were held back** (not added to the suite) and opened in a "
+                "**draft PR** for review: " + ", ".join(f"`{os.path.basename(p)}`" for p in quarantined) + ". "
+                "Do not merge it until the failure above is resolved."]
+    elif generated:
+        out += ["", "No generated spec was kept."]
+    else:
+        out += ["", "No new tests could be verified in this run, so there is no PR to review."]
+    out.append("")
+    return "\n".join(out)
+
+
+def write_report(analysis, static, inventory, selected, generated, results, failed, llm_error, quarantined, decision=""):
     br = analysis.get("blast_radius", {})
     scen = analysis.get("test_scenarios", [])
     covered = sum(1 for s in scen if s.get("status") == "covered")
@@ -1130,6 +1172,7 @@ def write_report(analysis, static, inventory, selected, generated, results, fail
         f"**Overall:** {'❌ FAILED' if failed else '✅ PASSED'}  |  **Risk:** {analysis.get('risk_level', '-')}"
         + ("  |  ⚠️ repo-wide change - all journeys considered" if static["full_run"] else ""),
         "",
+        *([decision] if decision else []),
         "## Impact summary",
         analysis.get("impact_summary", "-"),
         "",
@@ -1252,14 +1295,19 @@ def main():
     print("🧪 Stage 4: running affected tests only...")
     failed, results = run_e2e(selected, new_specs)
     quarantined = {}
+    decision = build_decision(results, generated, {}) if failed else ""
     if failed and generated:
         bad = [r for r in results if r[2] == "FAIL"]
         only_new = bool(bad) and all("generated" in (r[0] or "") for r in bad)
         quarantined = quarantine_generated_tests(generated)
+        decision = build_decision(results, generated, quarantined)
         if only_new:
             print("ℹ️  Only the new tests failed; existing tests are green. New specs quarantined.")
             failed = False
-    write_report(analysis, static, inventory, selected, generated, results, failed, llm_error, quarantined)
+    write_report(analysis, static, inventory, selected, generated, results, failed, llm_error, quarantined, decision)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(DECISION_FILE, "w", encoding="utf-8") as f:   # used as the draft-PR description by the workflow
+        f.write(decision)
     if qa_cost:
         qa_cost.write_reports(LLM_CALLS, RESULTS_DIR, CFG["pricing_file"], CFG["cost"])
         print(f"💰 Cost report: {RESULTS_DIR}/qa-cost-report.md (+ .html)")
