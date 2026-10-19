@@ -7,7 +7,8 @@ test('add, update, and remove an item from the cart', async ({ page }) => {
 
   await page.goto('/cart');
   await expect(page.getByRole('heading', { name: 'Shopping bag', exact: true })).toBeVisible();
-  await expect(page.getByText('Adventurer GPS Watch')).toBeVisible();
+  // scope to the cart row: the summary also names the priciest/cheapest item
+  await expect(page.locator('.cart-item').getByText('Adventurer GPS Watch')).toBeVisible();
 
   const quantity = page.locator('[data-cart-quantity-input]');
   await expect(quantity).toHaveValue('1');
