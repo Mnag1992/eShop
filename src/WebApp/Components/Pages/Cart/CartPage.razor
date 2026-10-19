@@ -114,6 +114,7 @@
                 <p class="cart-max-note" data-cart-max-note>Maximum @MaxQuantityPerItem per item</p>
                 <p class="cart-average-price" data-cart-average-price>Average price per item: $@AveragePricePerItem?.ToPriceDisplay()</p>
                 <p class="cart-priciest-item" data-cart-priciest-item>Priciest item: @PriciestItem?.ProductName ($@PriciestItem?.UnitPrice.ToPriceDisplay())</p>
+                <p class="cart-cheapest-item" data-cart-cheapest-item>Cheapest item: @CheapestItem?.ProductName ($@CheapestItem?.UnitPrice.ToPriceDisplay())</p>
                 <a href="checkout" class="button button-primary">Check out</a>
                 <a href="" class="cart-summary-link">
                     <img role="presentation" src="icons/arrow-left.svg" />
@@ -151,6 +152,9 @@
 
     // Distinct products in the bag, independent of their quantities.
     private string ProductCountLabel => basketItems?.Count == 1 ? "1 product" : $"{basketItems?.Count ?? 0} products";
+
+    // The product in the bag with the lowest unit price (first one wins on a tie).
+    private BasketItem? CheapestItem => basketItems?.OrderBy(i => i.UnitPrice).FirstOrDefault();
 
     // The product in the bag with the highest unit price (first one wins on a tie).
     private BasketItem? PriciestItem => basketItems?.OrderByDescending(i => i.UnitPrice).FirstOrDefault();
