@@ -1,0 +1,71 @@
+{
+  "_comment": "Project settings for the post-merge QA agent. Everything project-specific lives here so the script itself stays generic. See qa-agent/README.md.",
+
+  "project_name": "eShop",
+  "project_description": ".NET / Aspire reference e-commerce application: Blazor storefront (WebApp, WebAppComponents) backed by microservices (Catalog.API, Basket.API (gRPC + Redis), Ordering.API, Identity.API (login), Webhooks.API, OrderProcessor, PaymentProcessor) communicating over RabbitMQ integration events.",
+  "suite_description": "Playwright end-to-end tests (e2e/*.spec.ts) that drive the storefront in a browser, either anonymously or logged in as the seeded user.",
+
+  "src_dir": "src",
+  "e2e_dir": "e2e",
+  "generated_dir": "e2e/generated",
+  "login_setup": "e2e/login.setup.ts",
+  "source_extensions": [".cs", ".razor"],
+  "shared_dir": "src/Shared",
+  "excluded_projects": ["ClientApp", "HybridApp"],
+  "global_files": ["Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props",
+                   "global.json", "nuget.config", "playwright.config.ts", "package.json", "package-lock.json"],
+  "generic_types": ["Program", "Extensions", "GlobalUsings", "Constants", "Startup", "App", "Routes"],
+
+  "auth_specs": ["CartTest", "CheckoutTest"],
+  "all_specs": ["BrowseItemTest", "CartTest", "CheckoutTest"],
+  "default_specs": [],
+  "spec_map": {
+    "WebApp": ["BrowseItemTest", "CartTest", "CheckoutTest"],
+    "WebAppComponents": ["BrowseItemTest", "CartTest", "CheckoutTest"],
+    "eShop.AppHost": ["BrowseItemTest", "CartTest", "CheckoutTest"],
+    "eShop.ServiceDefaults": ["BrowseItemTest", "CartTest", "CheckoutTest"],
+    "Catalog.API": ["BrowseItemTest", "CartTest", "CheckoutTest"],
+    "Basket.API": ["CartTest", "CheckoutTest"],
+    "Identity.API": ["CartTest", "CheckoutTest"],
+    "Ordering.API": ["CheckoutTest"],
+    "Ordering.Domain": ["CheckoutTest"],
+    "Ordering.Infrastructure": ["CheckoutTest"],
+    "OrderProcessor": ["CheckoutTest"],
+    "PaymentProcessor": ["CheckoutTest"]
+  },
+
+  "helper_files": ["e2e/cart-helpers.ts"],
+
+  "ui_markup": {
+    "dirs": ["src/WebApp/Components/Pages", "src/WebApp/Components/Layout", "src/WebAppComponents"],
+    "extensions": [".razor"],
+    "budget_chars": 40000
+  },
+
+  "test_data": [
+    {
+      "file": "src/Catalog.API/Setup/catalog.json",
+      "title": "Seeded product catalog",
+      "note": "the ONLY products that exist; names and prices are exact",
+      "line": "- {Name} (${Price})"
+    }
+  ],
+
+  "prompts_dir": "qa-agent/prompts",
+  "pricing_file": "qa-agent/pricing.json",
+  "cost": {
+    "free_providers": ["github", "gemini"],
+    "reference_models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"],
+    "prs_per_month": 50
+  },
+
+  "prompt_vars": {
+    "example_step": "Add 'Adventurer GPS Watch' to the bag",
+    "example_test_id": "e2e/CartTest.spec.ts:4",
+    "example_page": "/cart",
+    "example_paths": "'/', '/cart', '/item/1'",
+    "helpers_rules": "reuse the existing helpers from '../cart-helpers' (addProductToCart, emptyCart, removeFirstCartItem) instead of re-implementing them. Imports are relative to e2e/generated/.",
+    "auth_rules": "Authentication is handled by the Playwright project (storage state) - never log in inside the test. Specs run serially and share the seeded user's basket: every test that touches the cart must start from emptyCart(page) and leave the cart empty.",
+    "app_rules": ""
+  }
+}
