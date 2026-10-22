@@ -115,6 +115,7 @@
                 <p class="cart-average-price" data-cart-average-price>Average price per item: $@AveragePricePerItem?.ToPriceDisplay()</p>
                 <p class="cart-priciest-item" data-cart-priciest-item>Priciest item: @PriciestItem?.ProductName ($@PriciestItem?.UnitPrice.ToPriceDisplay())</p>
                 <p class="cart-cheapest-item" data-cart-cheapest-item>Cheapest item: @CheapestItem?.ProductName ($@CheapestItem?.UnitPrice.ToPriceDisplay())</p>
+                <p class="cart-estimated-tax" data-cart-estimated-tax>Estimated tax (@((TaxRate * 100).ToString("0"))%): $@EstimatedTax?.ToPriceDisplay()</p>
                 <a href="checkout" class="button button-primary">Check out</a>
                 <a href="" class="cart-summary-link">
                     <img role="presentation" src="icons/arrow-left.svg" />
@@ -152,6 +153,10 @@
 
     // Distinct products in the bag, independent of their quantities.
     private string ProductCountLabel => basketItems?.Count == 1 ? "1 product" : $"{basketItems?.Count ?? 0} products";
+
+    // Flat sales-tax estimate shown on the bag (display only - checkout computes the real amount).
+    private const decimal TaxRate = 0.08m;
+    private decimal? EstimatedTax => TotalPrice is null ? null : Math.Round(TotalPrice.Value * TaxRate, 2);
 
     // The product in the bag with the lowest unit price (first one wins on a tie).
     private BasketItem? CheapestItem => basketItems?.OrderBy(i => i.UnitPrice).FirstOrDefault();
