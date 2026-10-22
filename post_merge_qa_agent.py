@@ -162,6 +162,7 @@ HTTP_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", "180"))
 MAX_HEAL_ATTEMPTS = int(os.getenv("MAX_HEAL_ATTEMPTS", "2"))
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504, 529}
+RATE_LIMIT_MAX_WAIT = int(os.getenv("LLM_RATE_LIMIT_MAX_WAIT", "90"))  # longest single wait on a 429 (seconds)
 
 
 class LLMUnavailable(Exception):
@@ -268,6 +269,23 @@ LLM_CALLS = []      # per call: purpose, provider, model, input/output tokens (f
 DEAD_MODELS = set()  # circuit breaker: models that already failed in this run are skipped
 
 
+def _retry_delay(headers, body):
+    """Seconds the provider asks us to wait (Retry-After header, Gemini retryDelay, 'retry after N seconds'), or None."""
+    try:
+        v = headers.get("Retry-After") if headers else None
+        if v and str(v).strip().isdigit():
+            return float(v)
+    except Exception:
+        pass
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', body) or re.search(r"retry after (\d+) seconds", body, re.I)
+    return float(m.group(1)) if m else None
+
+
+def _daily_quota_spent(body):
+    """Per-DAY quota exhaustion will not clear within a run - do not wait for it."""
+    return bool(re.search(r"PerDay|per day|daily", body, re.I))
+
+
 def _fit(text, limit):
     if len(text) <= limit:
         return text
@@ -304,11 +322,21 @@ def call_llm(system_prompt, user_prompt, json_mode=False, purpose=""):
                     print(f"   ↳ answered by {name}/{model}")
                     return text
                 except urllib.error.HTTPError as e:
-                    body = e.read().decode("utf-8", "ignore")[:300]
-                    errors.append(f"{name}/{model} HTTP {e.code}: {body}")
+                    full_body = e.read().decode("utf-8", "ignore")
+                    body = full_body[:300]
+                    daily = e.code == 429 and _daily_quota_spent(full_body)
+                    reason = "daily quota used up" if daily else "rate limited" if e.code == 429 else f"HTTP {e.code}"
+                    errors.append(f"{name}/{model}: {reason} (HTTP {e.code}) {body[:160]}")
+                    if daily:
+                        print(f"⚠️  {name}/{model}: free-tier DAILY quota is used up - skipping it (resets once a day)")
+                        DEAD_MODELS.add((name, model))
+                        break
                     if e.code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                        wait = (15 * attempt if e.code == 429 else min(30, 2 ** attempt)) + random.uniform(0, 1.5)
-                        print(f"⚠️  {name}/{model} busy (HTTP {e.code}), retry {attempt}/{MAX_RETRIES - 1} in {wait:.1f}s")
+                        asked = _retry_delay(e.headers, full_body)
+                        base = min(asked + 2, RATE_LIMIT_MAX_WAIT) if asked else (15 * attempt if e.code == 429 else min(30, 2 ** attempt))
+                        wait = base + random.uniform(0, 1.5)
+                        print(f"⚠️  {name}/{model} busy (HTTP {e.code}{', provider asked for %ds' % asked if asked else ''}), "
+                              f"retry {attempt}/{MAX_RETRIES - 1} in {wait:.1f}s")
                         time.sleep(wait)
                         continue
                     print(f"⚠️  {name}/{model} failed (HTTP {e.code}) -> trying next model/provider")
@@ -323,7 +351,8 @@ def call_llm(system_prompt, user_prompt, json_mode=False, purpose=""):
                         continue
                     DEAD_MODELS.add((name, model))
                     break
-    raise LLMUnavailable("No LLM provider available.\n   " + "\n   ".join(errors[-6:] or ["no API key/token configured"]))
+    reasons = list(dict.fromkeys(errors))[-6:] or ["no API key/token configured (set GEMINI_API_KEY / GITHUB_TOKEN / ANTHROPIC_API_KEY)"]
+    raise LLMUnavailable("No LLM provider available.\n   " + "\n   ".join(reasons))
 
 
 def parse_json(text):
@@ -763,6 +792,9 @@ Hard rules:
   { timeout: 15_000 } for assertions that wait on a server round-trip.
 - {{auth_rules}}
 - Only use pages, texts and elements that exist in the provided markup and specs.
+- Write top-level test() calls; do NOT wrap them in test.describe.
+- Scope text lookups to the smallest container (a list row, a panel): the same text, such as a product name, can appear in several places on one page, and a page-wide getByText then fails in strict mode. Prefer data-* attribute locators with toHaveText / toContainText.
+- A test that checks something is NOT shown must also assert something that proves the page rendered (for example an empty-state message); otherwise it can never fail.
 {{test_data_rules_agent2}}
 {{app_rules}}
 - Test titles: "<scenario id> <scenario title>".
@@ -792,13 +824,13 @@ def unique_path(name, suffix):
     return path
 
 
-def ui_markup(static):
+def ui_markup(static, only_changed=False):
     """UI markup Agent 2 can pick locators from: changed UI files first, then the configured pages."""
     ui = CFG["ui_markup"]
     exts = tuple(ui.get("extensions", [".razor"]))
     changed = [f for fs in static["changed_src_files"].values() for f in fs if f.endswith(exts)]
     files = list(changed)
-    for d in ui.get("dirs", []):
+    for d in ([] if only_changed else ui.get("dirs", [])):
         for ext in exts:
             files += sorted(norm(f) for f in glob.glob(f"{d}/**/*{ext}", recursive=True))
     blocks, budget = [], ui.get("budget_chars", 40000) + len(changed) * ui.get("changed_file_chars", 30000)
@@ -839,9 +871,17 @@ def agent_2_automate(analysis, static):
             f"## Existing framework: helpers and specs\n{framework}\n\n"
             f"## Storefront markup\n{markup}\n\n{catalog_block()}"
         )
+        # healing re-sends the prompt on every round: keep it small (helpers + the changed pages only)
+        helpers = "\n".join(f"### {f}\n```ts\n{read(f, 5000)}\n```" for f in HELPER_FILES if os.path.exists(f))
+        heal_context = (
+            f"Spec file: {path} ({'logged-in user' if auth == 'auth' else 'anonymous user'})\n\n"
+            f"## QA scenarios to automate\n{json.dumps(group, indent=2)}\n\n"
+            f"## Existing helpers\n{helpers}\n\n"
+            f"## Markup of the changed pages\n{ui_markup(static, only_changed=True)}\n\n{catalog_block()}"
+        )
         print(f"🤖 Agent 2: automating {len(group)} scenario(s) -> {path}")
         try:
-            written, dropped = write_with_self_healing(path, user_prompt)
+            written, dropped = write_with_self_healing(path, user_prompt, heal_context)
         except LLMUnavailable as e:  # keep Agent 1's analysis; never leave an unvalidated spec behind
             print(f"⚠️  Agent 2 could not finish {path}: {e}")
             if os.path.exists(path):
@@ -854,7 +894,7 @@ def agent_2_automate(analysis, static):
             for s in group:
                 sid = str(s.get("id"))
                 if sid in dropped_keys:
-                    s["note"] = "test failed when executed against the app - needs manual automation or review"
+                    s["note"] = "test failed when executed (or could not fail) - needs manual automation or review"
                 elif sid not in active:
                     s["note"] = "Agent 2 skipped this scenario (cannot be built from the available markup/test data) - manual check"
                 else:
@@ -950,7 +990,7 @@ def execute_spec(path):
     return result.returncode == 0, out[-6000:], failed
 
 
-TEST_START = re.compile(r"^test(?:\.\w+)?\(\s*(['\"`])(.+?)\1")
+TEST_START = re.compile(r"^\s*test(?:\.(?:only|skip|fixme|slow))?\(\s*(['\"`])(.+?)\1")
 
 
 def title_key(title):
@@ -959,17 +999,52 @@ def title_key(title):
     return parts[0] if parts else ""
 
 
+def _call_end(lines, i):
+    """Index of the line where the call that starts on lines[i] closes (skips strings and comments)."""
+    depth, started, q, in_block = 0, False, None, False
+    for n in range(i, len(lines)):
+        line, k = lines[n], 0
+        while k < len(line):
+            c = line[k]
+            if in_block:
+                if line.startswith("*/", k):
+                    in_block, k = False, k + 1
+            elif q:
+                if c == "\\":
+                    k += 1
+                elif c == q:
+                    q = None
+            elif line.startswith("//", k):
+                break
+            elif line.startswith("/*", k):
+                in_block, k = True, k + 1
+            elif c in "'\"`":
+                q = c
+            elif c in "([{":
+                depth, started = depth + 1, True
+            elif c in ")]}":
+                depth -= 1
+                if started and depth <= 0:
+                    return n
+            k += 1
+    return len(lines) - 1
+
+
 def split_tests(code):
-    """Split a spec into (header, [(title, block)]) at its top-level test() calls; None if the layout is unusual."""
+    """
+    Split a spec into (header, [(title, block)], footer). Works for top-level test() calls and for tests
+    wrapped in test.describe (the describe's closing line becomes the footer). None if no test is found.
+    """
     lines = code.split("\n")
     starts = [i for i, l in enumerate(lines) if TEST_START.match(l)]
-    if not starts or re.search(r"^\s*test\.describe", code, re.M):
+    if not starts:
         return None
+    last_end = _call_end(lines, starts[-1])
     blocks = []
     for n, i in enumerate(starts):
-        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        end = starts[n + 1] if n + 1 < len(starts) else last_end + 1
         blocks.append((TEST_START.match(lines[i]).group(2), "\n".join(lines[i:end])))
-    return "\n".join(lines[:starts[0]]), blocks
+    return "\n".join(lines[:starts[0]]), blocks, "\n".join(lines[last_end + 1:])
 
 
 def salvage_passing_tests(code, failed_titles):
@@ -977,7 +1052,7 @@ def salvage_passing_tests(code, failed_titles):
     parts = split_tests(code)
     if not parts or not failed_titles:
         return None
-    header, blocks = parts
+    header, blocks, footer = parts
     failed_keys = {title_key(t) for t in failed_titles}
     block_keys = {title_key(t) for t, _ in blocks}
     if not failed_keys <= block_keys:  # a failure outside our tests (e.g. the login setup)
@@ -985,10 +1060,24 @@ def salvage_passing_tests(code, failed_titles):
     kept = [b for t, b in blocks if title_key(t) not in failed_keys]
     if not kept:
         return None
-    return header + "\n" + "\n".join(kept), [t for t, _ in blocks if title_key(t) in failed_keys]
+    return header + "\n" + "\n".join(kept) + ("\n" + footer if footer.strip() else ""), \
+        [t for t, _ in blocks if title_key(t) in failed_keys]
 
 
-def write_with_self_healing(path, user_prompt):
+def find_vacuous_tests(code):
+    """Titles of tests that only assert something is NOT shown - they pass even when the feature is broken."""
+    parts = split_tests(code)
+    if not parts:
+        return []
+    out = []
+    for title, block in parts[1]:
+        expects = re.findall(r"expect\(.*", block)
+        if expects and all(".not." in e or ".not." in e.replace(" ", "") for e in expects):
+            out.append(title)
+    return out
+
+
+def write_with_self_healing(path, user_prompt, heal_context=None):
     """Returns (kept, dropped titles). kept=False means the whole spec was discarded."""
     code = strip_code_fences(call_llm(load_prompt("agent2"), user_prompt, purpose=f"Agent 2 {os.path.basename(path)}"))
     os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -1002,6 +1091,13 @@ def write_with_self_healing(path, user_prompt):
             ok, errors, failed_titles = execute_spec(path)
             errors = "The spec loaded but FAILED when executed against the running app:\n" + errors
         if ok:
+            weak = find_vacuous_tests(code)
+            if weak:  # passes, but could never fail: only asserts absence
+                ok, failed_titles = False, weak
+                errors = ("These tests only assert that something is NOT visible, so they would pass even if the feature "
+                          "were broken: " + ", ".join(weak) + ". Add an assertion that proves the page rendered "
+                          "(for example the empty-state message) or the exact expected value.")
+        if ok:
             print(f"✅ Agent 2: generated + validated + passing -> {path}")
             return True, []
         if attempt == MAX_HEAL_ATTEMPTS:
@@ -1010,8 +1106,8 @@ def write_with_self_healing(path, user_prompt):
         print("----- Agent 2 error output (tail) -----\n" + errors[-2500:] + "\n---------------------------------------")
         keep_note = (f"\nThese tests FAILED: {failed_titles}. Tests that are not listed passed - keep them unchanged "
                      "and fix only the failing ones.\n" if failed_titles else "")
-        fix_prompt = (f"{user_prompt}\n\n## Your previous code\n```ts\n{code}\n```\n\n"
-                      f"## Playwright / TypeScript errors\n{errors}\n{keep_note}\nReturn the corrected full file.")
+        fix_prompt = (f"{heal_context or user_prompt}\n\n## Your previous code\n```ts\n{code}\n```\n\n"
+                      f"## Playwright / TypeScript errors\n{errors[-6000:]}\n{keep_note}\nReturn the corrected full file.")
         code = strip_code_fences(call_llm(load_prompt("agent2"), fix_prompt, purpose=f"Agent 2 heal {os.path.basename(path)}"))
 
     # still failing: keep the tests that pass, drop only the ones that do not
@@ -1245,7 +1341,8 @@ def write_report(analysis, static, inventory, selected, generated, results, fail
             cost_cfg.get("prs_per_month", 50)))]
     lines += ["## LLM usage", *(f"- {u}" for u in LLM_USAGE_LOG or ["none"])]
     if llm_error:
-        lines += ["", f"> ⚠️ LLM fallback used: {llm_error.splitlines()[0]}"]
+        lines += ["", "> ⚠️ LLM fallback used: " + llm_error.splitlines()[0],
+                  *(f"> - {x.strip()}" for x in llm_error.splitlines()[1:])]
     report = "\n".join(lines) + "\n"
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:

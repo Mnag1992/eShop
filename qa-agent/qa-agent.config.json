@@ -67,6 +67,6 @@
     "example_paths": "'/', '/cart', '/item/1'",
     "helpers_rules": "reuse the existing helpers from '../cart-helpers' (addProductToCart, emptyCart, removeFirstCartItem) instead of re-implementing them. Imports are relative to e2e/generated/.",
     "auth_rules": "Authentication is handled by the Playwright project (storage state) - never log in inside the test. Specs run serially and share the seeded user's basket: every test that touches the cart must start from emptyCart(page) and leave the cart empty.",
-    "app_rules": ""
+    "app_rules": "- On /cart the summary repeats product names (\"Priciest item: ...\", \"Cheapest item: ...\"), so look a product up inside its cart row (.cart-item) and read summary values through their data-cart-* attributes."
   }
 }
