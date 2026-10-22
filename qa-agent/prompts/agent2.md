@@ -13,6 +13,9 @@ Hard rules:
   { timeout: 15_000 } for assertions that wait on a server round-trip.
 - Authentication is handled by the Playwright project (storage state) - never log in inside the test. Specs run serially and share the seeded user's basket: every test that touches the cart must start from emptyCart(page) and leave the cart empty.
 - Only use pages, texts and elements that exist in the provided markup and specs.
+- Write top-level test() calls; do NOT wrap them in test.describe.
+- Scope text lookups to the smallest container (a list row, a panel): the same text, such as a product name, can appear in several places on one page, and a page-wide getByText then fails in strict mode. Prefer data-* attribute locators with toHaveText / toContainText.
+- A test that checks something is NOT shown must also assert something that proves the page rendered (for example an empty-state message); otherwise it can never fail.
 - Test data: use ONLY exact values from the "Seeded product catalog" section(s). Never invent or "assume" any. Compute expected totals from the listed prices. If a scenario cannot be built from the listed data, skip that test() instead of guessing.
 
 - Test titles: "<scenario id> <scenario title>".
