@@ -41,12 +41,12 @@ Full local run: `.\run-qa-local.ps1 -Mode full -Base <sha> -Head main` (needs Do
 
 ## Using it in another project
 
-You need: a **Playwright (TypeScript) e2e suite**, git, GitHub Actions. The agent only reads files and runs `npx playwright test`.
+You need: an automated test suite in **any framework** (Playwright, Cypress, Jest, Vitest, pytest, or your own command - see *Test frameworks* below), git, GitHub Actions. The agent only reads files and runs your test command.
 
 1. Copy into the target repo: `post_merge_qa_agent.py`, the `qa-agent/` folder (without `prompts/`), `.github/workflows/post-merge-qa.yml`.
 2. Edit `qa-agent/qa-agent.config.json` (reference below). Minimum: `project_name`, `project_description`, `src_dir`,
    `e2e_dir`, `suite_description`.
-3. Make Playwright run the generated specs. In `playwright.config.ts` add the generated folder to a project, e.g.
+3. Make your framework run the generated tests. For Playwright, in `playwright.config.ts` add the generated folder to a project, e.g.
    `testMatch: ['**/generated/*.auth.spec.ts']` (logged-in) and `'**/generated/*.anon.spec.ts'` (anonymous).
 4. Edit the workflow: replace the `.NET` setup step with your runtime, make the app start the way your
    `playwright.config.ts` `webServer` expects, set `QA_GENERATED_DIR` to your `generated_dir`.
@@ -59,7 +59,9 @@ You need: a **Playwright (TypeScript) e2e suite**, git, GitHub Actions. The agen
 | Key | Meaning |
 |---|---|
 | `project_name`, `project_description`, `suite_description` | Plain-language context injected into both prompts. The better this describes your app, the better the scenarios. |
-| `src_dir`, `e2e_dir` | Application source and e2e tests. |
+| `src_dir`, `e2e_dir` | Application source and automated tests (default test folder depends on the runner preset). |
+| `runner` | **Which test framework** and how to run it - see *Test frameworks* below. |
+| `keep_env` | Secret-looking environment variables the tests really need (everything matching TOKEN/PASSWORD/... is hidden from test processes unless listed here). |
 | `generated_dir`, `login_setup` | Where new specs go; the Playwright login setup file (`""` if none). |
 | `source_extensions` | Source file types scanned for the type graph (`.cs`, `.razor`, `.ts`, `.tsx`, ...). |
 | `spec_map` | **Component → journeys.** Which e2e specs exercise each component (folder or .NET project) under `src_dir`. |
@@ -74,6 +76,64 @@ You need: a **Playwright (TypeScript) e2e suite**, git, GitHub Actions. The agen
 | `cost` | `free_providers`, `reference_models` and `prs_per_month` for the cost report. |
 
 Anything not set falls back to a generic default, so a minimal config works.
+
+## Test frameworks (the `runner` section)
+
+The pipeline never calls a framework directly. Everything framework-specific is the `runner` block of the config:
+
+```json
+"runner": { "preset": "pytest" }
+```
+
+| Preset | Test files | Run command | Notes |
+|---|---|---|---|
+| `playwright` (default) | `*.spec.ts` | `npx playwright test` | per-test selection (`file:line`), login-setup project, browser install in CI |
+| `cypress` | `*.cy.ts`, `*.cy.js` | `npx cypress run --spec` | file-level selection; add `junit` reporter support (built in to Cypress/mocha) |
+| `jest` | `*.test.ts/js` | `npx jest` | needs `jest-junit` (`npm i -D jest-junit`) |
+| `vitest` | `*.test.ts/js` | `npx vitest run` | JUnit reporter is built in |
+| `pytest` | `test_*.py`, `*_test.py` | `python -m pytest` | per-test selection (`file::test`); any plugin stack (Selenium, Playwright-python, requests) |
+| `generic` | you define it | you define it | start point for Robot Framework, Maven/Gradle (Selenium, REST-assured), .NET `dotnet test`, ... |
+
+Override any preset key; only the keys you set change:
+
+| Key | Meaning |
+|---|---|
+| `spec_globs`, `spec_suffix`, `support_exts` | Which files are tests; the suffix of generated files; extensions of helper files (a change in them re-runs every journey). |
+| `generated_name` | File name of generated tests, with `{name}` and `{auth}` (`auth`/`anon`), e.g. `test_{name}_{auth}.py`. |
+| `test_regex` | One regular expression per test declaration with a named group `title`. |
+| `block_style` | `call` (`test("..", () => {})` brace-matching) or `indent` (python `def test_x():`). Used to keep passing tests and drop failing ones. |
+| `title_key_regex` | Extracts the scenario id (e.g. `TC_CART_001`) from a test title. |
+| `id_template`, `target_template`, `targets_join` | How a test is identified in the inventory (`{file}:{line}`, `{file}::{title}`) and what is passed to the runner (`{id}` or `{file}` for file-level runners; `","` joins them into one argument). |
+| `list_cmd`, `list_ok_regex` | Command that proves a generated file loads (compile / collect). `[]` = skip; the execution step catches errors. |
+| `exec_cmd`, `exec_results` | Runs one generated file during self-healing. Results: `junit` (any framework) or `playwright-json`. |
+| `run_cmd` | Runs the affected tests; **must write a JUnit XML to `{junit}`**. |
+| `env`, `exec_env`, `headed_env` | Extra environment for the runs (tokens `{junit}`, `{json}`); `headed_env` is applied when `QA_HEADED=1`. |
+| `install_cmd` | One-off setup on CI (browser download); `[]` = none. |
+| `assert_regex`, `negative_markers` | The "test only asserts absence" check; set `[]` to disable. |
+| `agent2_rules`, `code_lang`, `language_name`, `label`, `automation_phrase` | Wording of the prompts (language, framework rules). |
+
+Command templates are argument lists. Tokens: `{spec}` (one file), `{targets}` (the selected tests, expands to many arguments),
+`{setup}` (login/setup project, dropped when not needed), `{junit}`, `{json}`. `"python"` means the interpreter running the agent.
+An item that ends up empty is dropped.
+
+**Custom framework example** (Maven + JUnit, file-level, results from surefire):
+
+```json
+"runner": {
+  "preset": "generic",
+  "label": "JUnit", "code_lang": "java", "language_name": "Java",
+  "e2e_dir": "src/test/java", "spec_globs": ["*IT.java"], "spec_suffix": "IT.java",
+  "generated_name": "{name}{auth}IT.java",
+  "test_regex": "^\\s*public void (?P<title>test\\w+)\\(", "block_style": "indent",
+  "id_template": "{file}::{title}", "target_template": "{file}",
+  "list_cmd": [], "exec_cmd": ["mvn", "-q", "test", "-Dtest={spec}"], "exec_results": "junit",
+  "run_cmd": ["mvn", "-q", "test"], "install_cmd": [], "assert_regex": ""
+}
+```
+
+Honest limits: JUnit-XML is the contract (nearly every framework can produce it); with file-level runners
+(Cypress, Jest, Java) a whole file is re-run, not one test; the "keep passing tests, drop failing" step needs a
+`test_regex` that matches one declaration per line.
 
 ## Prompts
 
