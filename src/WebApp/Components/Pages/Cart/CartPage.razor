@@ -115,6 +115,7 @@
                 <p class="cart-average-price" data-cart-average-price>Average price per item: $@AveragePricePerItem?.ToPriceDisplay()</p>
                 <p class="cart-priciest-item" data-cart-priciest-item>Priciest item: @PriciestItem?.ProductName ($@PriciestItem?.UnitPrice.ToPriceDisplay())</p>
                 <p class="cart-cheapest-item" data-cart-cheapest-item>Cheapest item: @CheapestItem?.ProductName ($@CheapestItem?.UnitPrice.ToPriceDisplay())</p>
+                <p class="cart-largest-line" data-cart-largest-line>Largest line total: $@LargestLineTotal?.ToPriceDisplay()</p>
                 <p class="cart-estimated-tax" data-cart-estimated-tax>Estimated tax (@((TaxRate * 100).ToString("0"))%): $@EstimatedTax?.ToPriceDisplay()</p>
                 <p class="cart-total-with-tax" data-cart-total-with-tax>Total with tax: $@TotalWithTax?.ToPriceDisplay()</p>
                 <p class="cart-shipping-cost" data-cart-shipping-cost>Shipping: @(ShippingCost == 0m ? "Free" : "$" + ShippingCost.ToPriceDisplay())</p>
@@ -171,6 +172,9 @@
     private BasketItem? CheapestItem => basketItems?.OrderBy(i => i.UnitPrice).FirstOrDefault();
 
     // The product in the bag with the highest unit price (first one wins on a tie).
+    // Highest Quantity x UnitPrice among the lines in the bag.
+    private decimal? LargestLineTotal => basketItems?.Select(i => i.Quantity * i.UnitPrice).DefaultIfEmpty(0m).Max();
+
     private BasketItem? PriciestItem => basketItems?.OrderByDescending(i => i.UnitPrice).FirstOrDefault();
 
     // Total price divided by the number of units in the bag (not the number of distinct products).
