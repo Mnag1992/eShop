@@ -3,7 +3,8 @@ Post-Merge Autonomous QA Pipeline (project-agnostic)
 ====================================================
 
 Triggered when a PR is merged into main (see .github/workflows/post-merge-qa.yml).
-The automation suite is a Playwright (TypeScript) end-to-end suite.
+The automation suite can be ANY test framework (Playwright, Cypress, Jest, Vitest, pytest or a custom
+command): everything framework-specific is the "runner" section of the config (see RUNNER_PRESETS).
 
 Everything project-specific lives in qa-agent/qa-agent.config.json (paths, journey map,
 test data, app description) and the LLM prompts in qa-agent/prompts/*.md (seeded from built-in
@@ -11,16 +12,16 @@ defaults on the first run, then always read from the files so they can be tuned)
 Token usage and cost are written to qa-results/qa-cost-report.{md,html}. Setup for a new
 project: qa-agent/README.md.
 
-Stage 1  Ingestion         -> git diff of the merged PR, mapped onto eShop's services (src/*).
+Stage 1  Ingestion         -> git diff of the merged PR, mapped onto the application's services (src/*).
 Stage 1b Static analysis   -> deterministic blast radius (no AI):
                                 * project graph from <ProjectReference> (reverse transitive closure)
                                 * types declared in changed files -> code that uses them
-                                * services -> user journeys (Playwright specs) that exercise them
+                                * services -> user journeys (test files) that exercise them
 Stage 2  Agent 1 (QA Architect)    -> LLM returns QA scenarios for the change and maps each one
                                       to the existing automated test(s) that cover it (or "missing").
-Stage 3  Agent 2 (Test Automation) -> automates the MISSING scenarios with the existing Playwright
+Stage 3  Agent 2 (Test Automation) -> automates the MISSING scenarios with the existing test
                                       framework (helpers, locator style, auth projects) in
-                                      e2e/generated/, validates them with `playwright test --list`
+                                      <tests>/generated/, validates them with the runner's list command
                                       and self-heals errors by feeding them back to the LLM.
 Stage 4  Targeted execution -> runs ONLY the affected tests (file:line) + the newly automated ones,
                                writes qa-report.md (also to the GitHub job summary).
@@ -33,15 +34,15 @@ If every provider is unavailable the pipeline does NOT crash: it falls back to t
 analysis and runs the specs of the impacted journeys.
 
 No third-party Python packages are required (only the standard library).
-Requires on PATH: git, node/npx (npm ci done) and dotnet (Playwright starts the AppHost).
+Requires on PATH: git, node/npx (npm ci done) and whatever your test framework / app needs (dotnet, python ...).
 
 Useful environment switches:
   QA_DRY_RUN=true   analysis only - no LLM calls, no test execution (prints the impact as JSON)
-  QA_HEADED=1       run Playwright with a visible browser (default is headless)
+  QA_HEADED=1       run the browser tests headed (runner.headed_env) (default is headless)
   DIFF_BASE/DIFF_HEAD  commits to compare (default: HEAD~1..HEAD; the workflow sets them for the PR)
 
 Security: LLM keys and the GitHub token are NEVER passed to the processes that execute
-repository or LLM-written code (Playwright / dotnet) - see clean_env().
+repository or LLM-written code (test framework / app build) - see clean_env().
 """
 
 import fnmatch
@@ -72,6 +73,119 @@ try:  # cost report lives in qa-agent/qa_cost.py (optional - the agent works wit
 except ImportError:
     qa_cost = None
 
+
+# --------------------------------------------------------------------------- #
+# Test-framework layer: everything that is specific to Playwright / Cypress / pytest ... lives in a
+# "runner" preset (overridable key by key in qa-agent.config.json -> "runner"). The pipeline itself
+# (diff -> impact -> Agent 1 -> Agent 2 -> run affected tests -> report) never mentions a framework.
+#
+# Command templates are argv lists. Tokens: {spec} one spec file, {targets} (expands to many args),
+# {setup} (login/setup project, empty when not needed), {junit}/{json} result files. "python" = this
+# interpreter. A template item that ends up empty is dropped. An empty list = "this step does not exist".
+# --------------------------------------------------------------------------- #
+_TS_RULES = """- import { test, expect } from '@playwright/test'; {{helpers_rules}}
+- baseURL is configured: navigate with relative paths ({{example_paths}}).
+- Follow the existing specs' style: role/label/text locators (getByRole, getByText,
+  getByLabel), data-* attributes that already exist in the markup, await every expect,
+  { timeout: 15_000 } for assertions that wait on a server round-trip.
+- {{auth_rules}}
+- Only use pages, texts and elements that exist in the provided markup and specs.
+- Write top-level test() calls; do NOT wrap them in test.describe.
+- Scope text lookups to the smallest container (a list row, a panel): the same text, such as a product name, can appear in several places on one page, and a page-wide getByText then fails in strict mode. Prefer data-* attribute locators with toHaveText / toContainText.
+- A test that checks something is NOT shown must also assert something that proves the page rendered (for example an empty-state message); otherwise it can never fail."""
+
+_PW = {
+    "label": "Playwright", "code_lang": "ts", "language_name": "TypeScript",
+    "automation_phrase": "through the user interface with Playwright",
+    "suite_description": "Playwright end-to-end tests that drive the application in a browser.",
+    "e2e_dir": "e2e", "global_files": ["playwright.config.ts", "package.json", "package-lock.json"],
+    "spec_globs": ["*.spec.ts"], "spec_suffix": ".spec.ts", "support_exts": [".ts"],
+    "generated_name": "{name}.{auth}.spec.ts",
+    "test_regex": r"^\s*test(?:\.(?:only|skip|fixme|slow))?\(\s*(['\"`])(?P<title>.+?)\1",
+    "block_style": "call", "title_key_regex": r"^\S+",
+    "id_template": "{file}:{line}", "target_template": "{id}", "targets_join": "",
+    "list_cmd": ["npx", "playwright", "test", "{spec}", "--list"], "list_ok_regex": r"Total: [1-9]\d* tests?",
+    "exec_cmd": ["npx", "playwright", "test", "{spec}", "{setup}", "--reporter=line,json", "--retries=0"],
+    "exec_results": "playwright-json",
+    "run_cmd": ["npx", "playwright", "test", "{targets}", "{setup}", "--reporter=line,junit,html"],
+    "env": {"PLAYWRIGHT_JUNIT_OUTPUT_NAME": "{junit}", "PLAYWRIGHT_HTML_OPEN": "never"},
+    "exec_env": {"PLAYWRIGHT_JSON_OUTPUT_NAME": "{json}"},
+    "headed_env": {"PW_HEADED": "1"},
+    "install_cmd": ["npx", "playwright", "install", "--with-deps", "chromium"],
+    "negative_markers": [".not."], "assert_regex": r"expect\(.*",
+    "agent2_rules": _TS_RULES,
+}
+_CY = {**_PW,
+    "label": "Cypress", "suite_description": "Cypress end-to-end tests that drive the application in a browser.",
+    "automation_phrase": "through the user interface with Cypress",
+    "e2e_dir": "cypress/e2e", "global_files": ["cypress.config.ts", "cypress.config.js", "package.json", "package-lock.json"],
+    "spec_globs": ["*.cy.ts", "*.cy.js"], "spec_suffix": ".cy.ts", "generated_name": "{name}.{auth}.cy.ts",
+    "test_regex": r"^\s*it(?:\.(?:only|skip))?\(\s*(['\"`])(?P<title>.+?)\1",
+    "id_template": "{file}:{line}", "target_template": "{file}", "targets_join": ",",
+    "list_cmd": [], "list_ok_regex": "",
+    "exec_cmd": ["npx", "cypress", "run", "--spec", "{spec}", "--reporter", "junit",
+                 "--reporter-options", "mochaFile={junit},toConsole=false"],
+    "exec_results": "junit",
+    "run_cmd": ["npx", "cypress", "run", "--spec", "{targets}", "--reporter", "junit",
+                "--reporter-options", "mochaFile={junit},toConsole=false"],
+    "env": {}, "exec_env": {}, "headed_env": {}, "install_cmd": [],
+    "negative_markers": ["not."], "assert_regex": r"\.should\(.*",
+    "agent2_rules": """- Use the Cypress API: describe is optional; write one it() per scenario. {{helpers_rules}}
+- baseUrl is configured: cy.visit() with relative paths ({{example_paths}}).
+- Follow the existing specs' style (cy.get with data-* attributes, cy.contains, .should assertions).
+- {{auth_rules}}
+- Only use pages, texts and elements that exist in the provided markup and specs.
+- Scope text lookups to the smallest container; the same text can appear several times on a page.
+- A test that checks something is NOT shown must also assert something that proves the page rendered.""",
+}
+_JEST = {**_PW,
+    "label": "Jest", "code_lang": "ts", "suite_description": "Jest tests (API / unit / integration) of the application.",
+    "automation_phrase": "with Jest", "e2e_dir": "tests", "global_files": ["jest.config.js", "jest.config.ts", "package.json", "package-lock.json"],
+    "spec_globs": ["*.test.ts", "*.test.js", "*.spec.ts"], "spec_suffix": ".test.ts", "generated_name": "{name}.{auth}.test.ts",
+    "test_regex": r"^\s*(?:it|test)(?:\.(?:only|skip))?\(\s*(['\"`])(?P<title>.+?)\1",
+    "target_template": "{file}", "targets_join": "",
+    "list_cmd": [], "list_ok_regex": "",
+    "exec_cmd": ["npx", "jest", "{spec}", "--ci"], "exec_results": "junit",
+    "run_cmd": ["npx", "jest", "{targets}", "--ci"], "env": {"JEST_JUNIT_OUTPUT_FILE": "{junit}"},
+    "exec_env": {"JEST_JUNIT_OUTPUT_FILE": "{junit}"}, "headed_env": {}, "install_cmd": [],
+    "negative_markers": [".not."], "assert_regex": r"expect\(.*",
+    "agent2_rules": """- Use Jest (`describe` is optional; one `it()` / `test()` per scenario). {{helpers_rules}}
+- Follow the existing tests' style and imports.
+- {{auth_rules}}
+- Only call functions, endpoints and data that exist in the provided source and tests.
+- A test that checks something is absent must also assert something that proves the code ran.""",
+}
+_JEST["run_cmd"] = ["npx", "jest", "{targets}", "--ci", "--reporters=default", "--reporters=jest-junit"]
+_JEST["exec_cmd"] = ["npx", "jest", "{spec}", "--ci", "--reporters=default", "--reporters=jest-junit"]
+_VITEST = {**_JEST, "label": "Vitest", "suite_description": "Vitest tests of the application.", "automation_phrase": "with Vitest",
+    "global_files": ["vitest.config.ts", "package.json", "package-lock.json"],
+    "exec_cmd": ["npx", "vitest", "run", "{spec}", "--reporter=default", "--reporter=junit", "--outputFile.junit={junit}"],
+    "run_cmd": ["npx", "vitest", "run", "{targets}", "--reporter=default", "--reporter=junit", "--outputFile.junit={junit}"],
+    "env": {}, "exec_env": {}}
+_PYTEST = {**_PW,
+    "label": "pytest", "code_lang": "python", "language_name": "Python",
+    "suite_description": "pytest tests (UI with Selenium/Playwright-python, or API) of the application.",
+    "automation_phrase": "with pytest", "e2e_dir": "tests",
+    "global_files": ["pytest.ini", "pyproject.toml", "requirements.txt", "conftest.py", "setup.cfg", "tox.ini"],
+    "spec_globs": ["test_*.py", "*_test.py"], "spec_suffix": ".py", "support_exts": [".py"],
+    "generated_name": "test_{name}_{auth}.py",
+    "test_regex": r"^(?:async\s+)?def\s+(?P<title>test\w*)\s*\(", "block_style": "indent",
+    "title_key_regex": r"^test_(\w+?_\d+)", "id_template": "{file}::{title}", "target_template": "{id}", "targets_join": "",
+    "list_cmd": ["python", "-m", "pytest", "{spec}", "--collect-only", "-q"], "list_ok_regex": r"[1-9]\d* tests? collected|::test",
+    "exec_cmd": ["python", "-m", "pytest", "{spec}", "-q", "-p", "no:cacheprovider", "--junitxml={junit}"], "exec_results": "junit",
+    "run_cmd": ["python", "-m", "pytest", "{targets}", "-q", "-p", "no:cacheprovider", "--junitxml={junit}"],
+    "env": {}, "exec_env": {}, "headed_env": {}, "install_cmd": [],
+    "negative_markers": [" not ", " is None", "== 0", "== []"], "assert_regex": r"\s*assert .*",
+    "agent2_rules": """- Write plain pytest functions (def test_<SCENARIO_ID>_<short_name>(...)), one per scenario, no classes. {{helpers_rules}}
+- Reuse the fixtures and helpers of the existing tests / conftest.py instead of re-implementing them.
+- {{auth_rules}}
+- Only use endpoints, pages, selectors and data that exist in the provided source and tests.
+- Test function names start with test_ followed by the scenario id, e.g. test_TC_CART_001_adds_item.
+- A test that checks something is absent must also assert something that proves the code ran.""",
+}
+RUNNER_PRESETS = {"playwright": _PW, "cypress": _CY, "jest": _JEST, "vitest": _VITEST, "pytest": _PYTEST}
+RUNNER_PRESETS["generic"] = {**_PW, "label": "custom framework"}  # starting point for a fully custom "runner"
+
 # --------------------------------------------------------------------------- #
 # Configuration (qa-agent/qa-agent.config.json; LLM settings via environment variables)
 # --------------------------------------------------------------------------- #
@@ -80,10 +194,10 @@ def _load_config():
     cfg = {
         "project_name": os.path.basename(os.getcwd()),
         "project_description": "a web application",
-        "suite_description": "Playwright end-to-end tests that drive the application in a browser.",
-        "src_dir": "src", "e2e_dir": "e2e", "generated_dir": "", "login_setup": "",
+        "suite_description": "", "runner": {"preset": "playwright"}, "keep_env": [],
+        "src_dir": "src", "e2e_dir": "", "generated_dir": "", "login_setup": "",
         "source_extensions": [".cs", ".razor"], "shared_dir": "", "excluded_projects": [],
-        "global_files": ["playwright.config.ts", "package.json", "package-lock.json"],
+        "global_files": [],
         "generic_types": ["Program", "Extensions", "GlobalUsings", "Constants", "Startup", "App", "Routes"],
         "auth_specs": [], "all_specs": [], "spec_map": {}, "default_specs": "all", "helper_files": [],
         "ui_markup": {"dirs": [], "extensions": [".razor"], "budget_chars": 40000},
@@ -98,18 +212,33 @@ def _load_config():
             user = json.load(f)
     except OSError:
         print(f"ℹ️  No config file at {path} - using generic defaults (see qa-agent/README.md).")
-        return cfg
+        user = {}
     for k, v in user.items():
         if k.startswith("_"):
             continue
         cfg[k] = {**cfg[k], **v} if isinstance(v, dict) and isinstance(cfg.get(k), dict) else v
+    # the test framework: preset defaults, then the "runner" section of the config on top
+    r = cfg.get("runner") or {}
+    preset = RUNNER_PRESETS.get(r.get("preset", "playwright"))
+    if preset is None:
+        raise SystemExit(f"❌ Unknown runner preset '{r.get('preset')}'. Available: {', '.join(RUNNER_PRESETS)}")
+    runner = {**preset, **{k: v for k, v in r.items() if k != "preset"}}
+    for k in ("env", "exec_env", "headed_env"):  # environment maps merge instead of replace
+        runner[k] = {**preset.get(k, {}), **(r.get(k) or {})}
+    cfg["runner"] = runner
+    cfg["e2e_dir"] = cfg["e2e_dir"] or runner["e2e_dir"]
+    cfg["suite_description"] = cfg["suite_description"] or runner["suite_description"]
+    cfg["global_files"] = cfg["global_files"] or runner["global_files"]
     return cfg
 
 
 CFG = _load_config()
 SRC_DIR = CFG["src_dir"]
 E2E_DIR = CFG["e2e_dir"]
-GENERATED_DIR = CFG["generated_dir"] or f"{E2E_DIR}/generated"   # <generated_dir>/<Owner>__<Name>.<auth|anon>.spec.ts
+RUNNER = CFG["runner"]
+CODE_LANG = RUNNER["code_lang"]
+SPEC_SUFFIX = RUNNER["spec_suffix"]
+GENERATED_DIR = CFG["generated_dir"] or f"{E2E_DIR}/generated"   # <generated_dir>/<Owner>__<Name>.<auth|anon> + spec suffix
 LOGIN_SETUP = CFG["login_setup"]            # "" = the suite has no login setup project
 RESULTS_DIR = "qa-results"
 QUARANTINE_DIR = "qa-quarantine"
@@ -121,14 +250,28 @@ GLOBAL_FILES = set(CFG["global_files"])     # repo-wide build inputs: a change h
 GENERIC_TYPES = set(CFG["generic_types"])   # type names too generic to follow through the type graph
 AUTH_SPECS = set(CFG["auth_specs"])         # specs that run as the logged-in user (playwright.config.ts project)
 HELPER_FILES = list(CFG["helper_files"])
-APP_PORT = int(CFG["app_port"] or 0)        # port the Playwright webServer listens on (0 = do not manage it)
+APP_PORT = int(CFG["app_port"] or 0)        # port the test framework's web server listens on (0 = do not manage it)
+TEST_RE = re.compile(RUNNER["test_regex"])  # one test declaration per line; group "title"
+GEN_TEMPLATE = RUNNER["generated_name"]     # e.g. "{name}.{auth}.spec.ts" or "test_{name}_{auth}.py"
+_gen_parts = GEN_TEMPLATE.split("{name}")
+GEN_PREFIX = _gen_parts[0]                  # text before the name ("test_" for pytest)
+_GEN_RE = re.compile("^" + re.escape(GEN_TEMPLATE).replace(re.escape("{name}"), r"(?P<name>.+?)")
+                     .replace(re.escape("{auth}"), r"(?P<auth>auth|anon)") + "$")
+
+
+def is_spec_file(path):
+    """A test file of the suite (not a helper): matches runner.spec_globs."""
+    return any(fnmatch.fnmatch(os.path.basename(path), g) for g in RUNNER["spec_globs"])
+
+
+def list_spec_files(pattern_dir, recursive=False):
+    found = glob.glob(f"{pattern_dir}/**/*", recursive=True) if recursive else glob.glob(f"{pattern_dir}/*")
+    return sorted(p.replace("\\", "/") for p in found if os.path.isfile(p) and is_spec_file(p))
 
 
 def _discover_specs():
-    names = []
-    for p in sorted(glob.glob(f"{E2E_DIR}/*.spec.ts")):
-        names.append(os.path.basename(p)[:-len(".spec.ts")])
-    return names
+    return [os.path.basename(p)[:-len(SPEC_SUFFIX)] for p in list_spec_files(E2E_DIR)
+            if p.endswith(SPEC_SUFFIX)]
 
 
 ALL_SPECS = list(CFG["all_specs"]) or _discover_specs()
@@ -369,7 +512,7 @@ def parse_json(text):
 
 def strip_code_fences(code):
     code = code.strip()
-    m = re.search(r"```(?:typescript|ts)?\s*(.*?)```", code, re.DOTALL)
+    m = re.search(r"```[A-Za-z]*\s*(.*?)```", code, re.DOTALL)
     return (m.group(1) if m else code).strip()
 
 
@@ -383,7 +526,7 @@ def run(cmd, **kw):
 # Anything that executes repository code or LLM-written tests (Playwright, dotnet) must not be
 # able to read the LLM keys or the GitHub token, or a malicious PR could exfiltrate them.
 SECRET_ENV = re.compile(r"(TOKEN|API_KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
-KEEP_ENV = {"USERNAME1", "PASSWORD"}  # seeded demo user the e2e login uses (public in the README)
+KEEP_ENV = set(CFG["keep_env"])  # secret-looking variables the tests legitimately need (e.g. a public demo login)
 
 
 def clean_env(extra=None):
@@ -413,12 +556,23 @@ def norm(path):
 
 
 def spec_file(name):
-    return f"{E2E_DIR}/{name}.spec.ts"
+    return f"{E2E_DIR}/{name}{SPEC_SUFFIX}"
 
 
 def is_auth_spec(path):
     name = os.path.basename(path)
-    return name.endswith(".auth.spec.ts") or name.split(".")[0] in AUTH_SPECS
+    m = _GEN_RE.match(name)
+    if m:  # a generated spec says in its name whether it runs as the logged-in user
+        return m.group("auth") == "auth"
+    return name.split(".")[0] in AUTH_SPECS or name[:-len(SPEC_SUFFIX)] in AUTH_SPECS
+
+
+def generated_owner(path):
+    """Project a generated spec belongs to (first part of Owner__Name)."""
+    base = os.path.basename(path)
+    if GEN_PREFIX and base.startswith(GEN_PREFIX):
+        base = base[len(GEN_PREFIX):]
+    return base.split("__")[0]
 
 
 TYPE_DECL = re.compile(r"\b(?:class|record|interface|struct|enum)\s+([A-Z]\w*)")
@@ -437,17 +591,20 @@ def declared_types(path):
 # --------------------------------------------------------------------------- #
 # Existing automation suite (Playwright)
 # --------------------------------------------------------------------------- #
-TEST_DECL = re.compile(r"^\s*test(?:\.(?:only|skip|fixme|slow))?\(\s*(['\"`])(.+?)\1")
+def test_title(line):
+    m = TEST_RE.match(line)
+    return m.group("title") if m else None
 
 
 def load_e2e_inventory():
     """Every automated test: {"id": "e2e/CartTest.spec.ts:4", "file", "line", "title", "auth"}"""
     tests = []
-    for f in sorted(norm(p) for p in glob.glob(f"{E2E_DIR}/**/*.spec.ts", recursive=True)):
+    for f in list_spec_files(E2E_DIR, recursive=True):
         for i, line in enumerate(read(f).splitlines(), start=1):
-            m = TEST_DECL.match(line)
-            if m:
-                tests.append({"id": f"{f}:{i}", "file": f, "line": i, "title": m.group(2), "auth": is_auth_spec(f)})
+            title = test_title(line)
+            if title is not None:
+                tests.append({"id": RUNNER["id_template"].format(file=f, line=i, title=title), "file": f, "line": i,
+                              "title": title, "auth": is_auth_spec(f)})
     return tests
 
 
@@ -529,8 +686,8 @@ def static_impact(changed_files, projects):
                 changed_src.setdefault(owner, []).append(f)
         elif f.startswith(SHARED_DIR + "/"):
             full_run = True  # shared code that no known project links: be safe, consider every journey
-        elif f.startswith(f"{E2E_DIR}/") and f.endswith(".ts"):
-            if f.endswith(".spec.ts"):
+        elif f.startswith(f"{E2E_DIR}/") and f.endswith(tuple(RUNNER["support_exts"])):
+            if is_spec_file(f):
                 changed_e2e.add(f)
             else:  # shared helpers / login setup -> every journey may be affected
                 full_run = True
@@ -571,8 +728,8 @@ def static_impact(changed_files, projects):
     specs = set(changed_e2e)
     for n in (projects if full_run else impacted):
         specs.update(spec_file(s) for s in specs_for(n))
-    impacted_generated = [norm(f) for f in glob.glob(f"{GENERATED_DIR}/*.spec.ts")
-                          if full_run or os.path.basename(f).split("__")[0] in impacted]
+    impacted_generated = [f for f in list_spec_files(GENERATED_DIR)
+                          if full_run or generated_owner(f) in impacted]
     specs.update(impacted_generated)
 
     return {
@@ -593,10 +750,13 @@ def static_impact(changed_files, projects):
 def prompt_vars():
     v = {
         "project_name": CFG["project_name"], "project_description": CFG["project_description"],
-        "suite_description": CFG["suite_description"],
-        "example_step": "Perform an action in the application", "example_test_id": f"{E2E_DIR}/Example.spec.ts:4",
+        "suite_description": CFG["suite_description"], "automation_phrase": RUNNER["automation_phrase"],
+        "runner_label": RUNNER["label"], "code_lang_name": RUNNER.get("language_name", "code"),
+        "runner_rules": RUNNER["agent2_rules"],
+        "example_step": "Perform an action in the application",
+        "example_test_id": RUNNER["id_template"].format(file=f"{E2E_DIR}/Example{SPEC_SUFFIX}", line=4, title="test_example"),
         "example_page": "/", "example_paths": "'/', '/some-page'", "helpers_rules": "reuse the existing helpers from the framework section instead of re-implementing them.",
-        "auth_rules": "Authentication is handled by the Playwright project (storage state) - never log in inside the test.",
+        "auth_rules": "Authentication is handled by the test framework's setup (stored session) - never log in inside the test.",
         "app_rules": "",
     }
     titles = [e.get("title", "Test data") for e in CFG["test_data"]]
@@ -616,7 +776,8 @@ def prompt_vars():
 
 def render_prompt(text):
     vars_ = prompt_vars()
-    text = re.sub(r"\{\{(\w+)\}\}", lambda m: str(vars_.get(m.group(1), "")), text)
+    for _ in range(3):  # a variable's value may itself contain {{variables}} (e.g. runner_rules)
+        text = re.sub(r"\{\{(\w+)\}\}", lambda m: str(vars_.get(m.group(1), "")), text)
     return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
 
 
@@ -692,7 +853,7 @@ Tasks:
    verifies it, status = "covered" and list the test ids (exactly as given in the inventory,
    e.g. "{{example_test_id}}"). Be strict - only if the test really asserts it.
 4. If not covered: status = "missing", and automatable = true only if it can be verified
-   through the user interface with Playwright; otherwise automatable = false (manual check).
+   {{automation_phrase}}; otherwise automatable = false (manual check).
 
 Return ONLY this JSON (do not change its shape):
 {
@@ -747,7 +908,7 @@ def build_agent1_prompt(diff_text, static, inventory):
     parts.append("## Current source of changed files\n" + "\n".join(src_block))
     spec_files = list(dict.fromkeys(static["candidate_specs"] + sorted({t["file"] for t in inventory})))
     parts.append("## Source of existing automated tests\n"
-                 + "\n".join(f"### {f}\n```ts\n{read(f, 5000)}\n```" for f in spec_files))
+                 + "\n".join(f"### {f}\n```{CODE_LANG}\n{read(f, 5000)}\n```" for f in spec_files))
     return "\n\n".join(parts)
 
 
@@ -777,35 +938,57 @@ def rule_based_scenarios(static):
 
 
 # --------------------------------------------------------------------------- #
-# Stage 3: Agent 2 - Test Automation Engineer (Playwright, self-healing)
+# Stage 3: Agent 2 - Test Automation Engineer (self-healing)
 # --------------------------------------------------------------------------- #
 DEFAULT_AGENT2_PROMPT = """
-You are Agent 2, a senior test automation engineer extending {{project_name}}'s existing Playwright
-(TypeScript) end-to-end suite. Automate ALL given QA scenarios in ONE spec file
-(one test() per scenario) so it fits seamlessly into the existing framework.
+You are Agent 2, a senior test automation engineer extending {{project_name}}'s existing {{runner_label}}
+({{code_lang_name}}) suite. Automate ALL given QA scenarios in ONE test file
+(one test per scenario) so it fits seamlessly into the existing framework.
 
 Hard rules:
-- import { test, expect } from '@playwright/test'; {{helpers_rules}}
-- baseURL is configured: navigate with relative paths ({{example_paths}}).
-- Follow the existing specs' style: role/label/text locators (getByRole, getByText,
-  getByLabel), data-* attributes that already exist in the markup, await every expect,
-  { timeout: 15_000 } for assertions that wait on a server round-trip.
-- {{auth_rules}}
-- Only use pages, texts and elements that exist in the provided markup and specs.
-- Write top-level test() calls; do NOT wrap them in test.describe.
-- Scope text lookups to the smallest container (a list row, a panel): the same text, such as a product name, can appear in several places on one page, and a page-wide getByText then fails in strict mode. Prefer data-* attribute locators with toHaveText / toContainText.
-- A test that checks something is NOT shown must also assert something that proves the page rendered (for example an empty-state message); otherwise it can never fail.
+{{runner_rules}}
 {{test_data_rules_agent2}}
 {{app_rules}}
-- Test titles: "<scenario id> <scenario title>".
-- Output ONLY TypeScript code, no markdown, no explanations.
+- Test titles / names start with the scenario id: "<scenario id> <scenario title>".
+- Output ONLY {{code_lang_name}} code, no markdown, no explanations.
 """
 
 
-def playwright_list(spec):
-    result = run([tool("npx"), "playwright", "test", spec, "--list"], env=clean_env())  # loading a spec executes it
+def build_cmd(template, **tokens):
+    """argv from a runner template. {targets}/{setup} may expand to several args or none; empty items are dropped."""
+    argv = []
+    for item in template:
+        hit = [k for k in tokens if "{" + k + "}" in item]
+        if item in ("{targets}", "{setup}") and isinstance(tokens.get(item[1:-1]), list):
+            argv.extend(tokens[item[1:-1]])
+            continue
+        for k in hit:
+            v = tokens[k]
+            item = item.replace("{" + k + "}", ",".join(v) if isinstance(v, list) else str(v))
+        if item.strip():
+            argv.append(item)
+    if argv and argv[0] == "python":
+        argv[0] = sys.executable
+    elif argv:
+        argv[0] = tool(argv[0])
+    return argv
+
+
+def runner_env(base, tokens, headed=False):
+    env = dict(RUNNER["env"] if base == "run" else {**RUNNER["env"], **RUNNER["exec_env"]})
+    if headed:
+        env.update(RUNNER["headed_env"])
+    return {k: str(v).replace("{junit}", tokens.get("junit", "")).replace("{json}", tokens.get("json", ""))
+            for k, v in env.items()}
+
+
+def validate_spec(spec):
+    """Does the generated file load / compile / collect at least one test? (no list command = skip, execution checks it)"""
+    if not RUNNER["list_cmd"]:
+        return True, ""
+    result = run(build_cmd(RUNNER["list_cmd"], spec=spec), env=clean_env())  # loading a spec executes it
     out = result.stdout + result.stderr
-    ok = result.returncode == 0 and re.search(r"Total: [1-9]\d* tests?", out) is not None
+    ok = result.returncode == 0 and (not RUNNER["list_ok_regex"] or re.search(RUNNER["list_ok_regex"], out) is not None)
     return ok, out[-6000:]
 
 
@@ -814,12 +997,12 @@ def safe_name(name, fallback):
     return name if name and name[0].isalpha() else fallback
 
 
-def unique_path(name, suffix):
+def unique_path(name, auth):
     base, n = name, 2
-    path = f"{GENERATED_DIR}/{name}{suffix}"
+    path = f"{GENERATED_DIR}/{GEN_TEMPLATE.format(name=name, auth=auth)}"
     while os.path.exists(path):  # never overwrite an existing test - it is the regression baseline
         name = f"{base}V{n}"
-        path = f"{GENERATED_DIR}/{name}{suffix}"
+        path = f"{GENERATED_DIR}/{GEN_TEMPLATE.format(name=name, auth=auth)}"
         n += 1
     return path
 
@@ -859,12 +1042,12 @@ def agent_2_automate(analysis, static):
         key = (safe_name(s.get("target_spec"), "GeneratedImpact"), "auth" if s.get("logged_in", True) else "anon")
         groups.setdefault(key, []).append(s)
 
-    framework = "\n".join(f"### {f}\n```ts\n{read(f, 5000)}\n```"
+    framework = "\n".join(f"### {f}\n```{CODE_LANG}\n{read(f, 5000)}\n```"
                           for f in [*HELPER_FILES, *(spec_file(s) for s in ALL_SPECS)] if os.path.exists(f))
     markup = ui_markup(static)
     generated = []
     for (name, auth), group in groups.items():
-        path = unique_path(f"{safe_name(owner, 'WebApp')}__{name}", f".{auth}.spec.ts")
+        path = unique_path(f"{safe_name(owner, 'WebApp')}__{name}", auth)
         user_prompt = (
             f"Spec file: {path} ({'logged-in user' if auth == 'auth' else 'anonymous user'})\n\n"
             f"## QA scenarios to automate\n{json.dumps(group, indent=2)}\n\n"
@@ -872,7 +1055,7 @@ def agent_2_automate(analysis, static):
             f"## Storefront markup\n{markup}\n\n{catalog_block()}"
         )
         # healing re-sends the prompt on every round: keep it small (helpers + the changed pages only)
-        helpers = "\n".join(f"### {f}\n```ts\n{read(f, 5000)}\n```" for f in HELPER_FILES if os.path.exists(f))
+        helpers = "\n".join(f"### {f}\n```{CODE_LANG}\n{read(f, 5000)}\n```" for f in HELPER_FILES if os.path.exists(f))
         heal_context = (
             f"Spec file: {path} ({'logged-in user' if auth == 'auth' else 'anonymous user'})\n\n"
             f"## QA scenarios to automate\n{json.dumps(group, indent=2)}\n\n"
@@ -889,7 +1072,7 @@ def agent_2_automate(analysis, static):
             written, dropped = False, []
         if written:
             generated.append(path)
-            active = {title_key(m.group(2)) for line in read(path).splitlines() for m in [TEST_DECL.match(line)] if m}
+            active = {title_key(t) for t in map(test_title, read(path).splitlines()) if t is not None}
             dropped_keys = {title_key(t) for t in dropped}
             for s in group:
                 sid = str(s.get("id"))
@@ -948,13 +1131,34 @@ def ensure_port_free(port=None, wait=90):
 
 
 def ensure_browsers():
-    """CI runners start without Playwright browsers; install once, before the first test run."""
+    """CI runners start without browsers / drivers; run the framework's install command once (runner.install_cmd)."""
     global _BROWSERS_READY
-    if _BROWSERS_READY or not os.getenv("CI"):
+    if _BROWSERS_READY or not os.getenv("CI") or not RUNNER["install_cmd"]:
         return
-    print("🌐 Installing Playwright Chromium...")
-    subprocess.run([tool("npx"), "playwright", "install", "--with-deps", "chromium"], env=clean_env())
+    print(f"🌐 Installing {RUNNER['label']} browsers/drivers...")
+    subprocess.run(build_cmd(RUNNER["install_cmd"]), env=clean_env())
     _BROWSERS_READY = True
+
+
+def parse_junit(path):
+    """Rows (classname, name, PASS|FAIL|SKIP, seconds, message) of a JUnit XML file (empty if missing/unreadable)."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return rows
+    for tc in root.iter("testcase"):
+        status, msg = "PASS", ""
+        for tag in ("failure", "error"):
+            node = tc.find(tag)
+            if node is not None:
+                status, msg = "FAIL", (node.get("message") or (node.text or ""))[:150]
+        if tc.find("skipped") is not None:
+            status = "SKIP"
+        rows.append((tc.get("classname", ""), tc.get("name"), status, tc.get("time", ""), msg))
+    return rows
 
 
 def execute_spec(path):
@@ -966,16 +1170,19 @@ def execute_spec(path):
     ensure_port_free()
     os.makedirs(RESULTS_DIR, exist_ok=True)
     report = os.path.abspath(os.path.join(RESULTS_DIR, "heal-run.json"))
-    if os.path.exists(report):
-        os.remove(report)
-    result = run([tool("npx"), "playwright", "test", path, *([LOGIN_SETUP] if LOGIN_SETUP else []),
-                  "--reporter=line,json", "--retries=0"],
-                 env=clean_env({"ESHOP_USE_HTTP_ENDPOINTS": os.getenv("ESHOP_USE_HTTP_ENDPOINTS", "1"),
-                                "PLAYWRIGHT_JSON_OUTPUT_NAME": report}))
+    junit = os.path.abspath(os.path.join(RESULTS_DIR, "heal-run.xml"))
+    for p in (report, junit):
+        if os.path.exists(p):
+            os.remove(p)
+    tokens = {"spec": path, "setup": [LOGIN_SETUP] if LOGIN_SETUP else [], "json": report, "junit": junit}
+    result = run(build_cmd(RUNNER["exec_cmd"], **tokens), env=clean_env(runner_env("exec", tokens)))
     out = result.stdout + result.stderr
-    ensure_port_free()  # the app must be gone before the next Playwright start
+    ensure_port_free()  # the app must be gone before the next start
     failed = []
-    try:
+    if RUNNER["exec_results"] == "junit":
+        failed = [r[1] for r in parse_junit(junit) if r[2] == "FAIL"]
+    else:
+      try:
         def walk(suite):
             for sp in suite.get("specs", []):
                 if not sp.get("ok", True):
@@ -985,18 +1192,15 @@ def execute_spec(path):
         with open(report, encoding="utf-8") as f:
             for suite in json.load(f).get("suites", []):
                 walk(suite)
-    except (OSError, ValueError):
+      except (OSError, ValueError):
         pass
     return result.returncode == 0, out[-6000:], failed
 
 
-TEST_START = re.compile(r"^\s*test(?:\.(?:only|skip|fixme|slow))?\(\s*(['\"`])(.+?)\1")
-
-
 def title_key(title):
     """Scenario id = first word of a test title (e.g. 'TC_CART_001'); robust against quote escaping."""
-    parts = (title or "").split()
-    return parts[0] if parts else ""
+    m = re.search(RUNNER["title_key_regex"], title or "")
+    return (m.group(1) if m and m.groups() else m.group(0)) if m else ""
 
 
 def _call_end(lines, i):
@@ -1032,18 +1236,31 @@ def _call_end(lines, i):
 
 def split_tests(code):
     """
-    Split a spec into (header, [(title, block)], footer). Works for top-level test() calls and for tests
-    wrapped in test.describe (the describe's closing line becomes the footer). None if no test is found.
+    Split a spec into (header, [(title, block)], footer). None if no test is found.
+    block_style "call": test("..", () => {..}) calls (also wrapped in a describe: its closing line is the footer).
+    block_style "indent": python-style `def test_x():` functions (decorators belong to the function below them).
     """
     lines = code.split("\n")
-    starts = [i for i, l in enumerate(lines) if TEST_START.match(l)]
+    starts = [i for i, l in enumerate(lines) if test_title(l) is not None]
     if not starts:
         return None
+    if RUNNER["block_style"] == "indent":
+        begins = []
+        for i in starts:
+            b = i
+            while b > 0 and lines[b - 1].lstrip().startswith("@"):
+                b -= 1
+            begins.append(b)
+        blocks = []
+        for n, i in enumerate(starts):
+            end = begins[n + 1] if n + 1 < len(starts) else len(lines)
+            blocks.append((test_title(lines[i]), "\n".join(lines[begins[n]:end]).rstrip("\n") + "\n"))
+        return "\n".join(lines[:begins[0]]), blocks, ""
     last_end = _call_end(lines, starts[-1])
     blocks = []
     for n, i in enumerate(starts):
         end = starts[n + 1] if n + 1 < len(starts) else last_end + 1
-        blocks.append((TEST_START.match(lines[i]).group(2), "\n".join(lines[i:end])))
+        blocks.append((test_title(lines[i]), "\n".join(lines[i:end])))
     return "\n".join(lines[:starts[0]]), blocks, "\n".join(lines[last_end + 1:])
 
 
@@ -1071,8 +1288,10 @@ def find_vacuous_tests(code):
         return []
     out = []
     for title, block in parts[1]:
-        expects = re.findall(r"expect\(.*", block)
-        if expects and all(".not." in e or ".not." in e.replace(" ", "") for e in expects):
+        if not RUNNER["assert_regex"] or not RUNNER["negative_markers"]:
+            return []  # this framework has no "only asserts absence" check
+        expects = re.findall(RUNNER["assert_regex"], block)
+        if expects and all(any(m in e or m in e.replace(" ", "") for m in RUNNER["negative_markers"]) for e in expects):
             out.append(title)
     return out
 
@@ -1085,7 +1304,7 @@ def write_with_self_healing(path, user_prompt, heal_context=None):
     for attempt in range(MAX_HEAL_ATTEMPTS + 1):
         with open(path, "w", encoding="utf-8") as f:
             f.write(code + "\n")
-        ok, errors = playwright_list(path)
+        ok, errors = validate_spec(path)
         failed_titles = []
         if ok:  # loads fine - now prove it passes against the real app (catches invented data)
             ok, errors, failed_titles = execute_spec(path)
@@ -1106,8 +1325,8 @@ def write_with_self_healing(path, user_prompt, heal_context=None):
         print("----- Agent 2 error output (tail) -----\n" + errors[-2500:] + "\n---------------------------------------")
         keep_note = (f"\nThese tests FAILED: {failed_titles}. Tests that are not listed passed - keep them unchanged "
                      "and fix only the failing ones.\n" if failed_titles else "")
-        fix_prompt = (f"{heal_context or user_prompt}\n\n## Your previous code\n```ts\n{code}\n```\n\n"
-                      f"## Playwright / TypeScript errors\n{errors[-6000:]}\n{keep_note}\nReturn the corrected full file.")
+        fix_prompt = (f"{heal_context or user_prompt}\n\n## Your previous code\n```{CODE_LANG}\n{code}\n```\n\n"
+                      f"## {RUNNER['label']} / {RUNNER.get('language_name', 'code')} errors\n{errors[-6000:]}\n{keep_note}\nReturn the corrected full file.")
         code = strip_code_fences(call_llm(load_prompt("agent2"), fix_prompt, purpose=f"Agent 2 heal {os.path.basename(path)}"))
 
     # still failing: keep the tests that pass, drop only the ones that do not
@@ -1116,7 +1335,7 @@ def write_with_self_healing(path, user_prompt, heal_context=None):
         kept_code, dropped = salvaged
         with open(path, "w", encoding="utf-8") as f:
             f.write(kept_code + "\n")
-        ok, _ = playwright_list(path)
+        ok, _ = validate_spec(path)
         if ok:
             ok, _, _ = execute_spec(path)
         if ok:
@@ -1156,45 +1375,33 @@ def select_tests(analysis, static, inventory, generated, llm_ok):
 
 
 def run_e2e(selected, generated):
-    targets = [t["id"] for t in selected] + generated
+    ids = [RUNNER["target_template"].format(id=t["id"], file=t["file"], line=t["line"], title=t["title"]) for t in selected]
+    targets = list(dict.fromkeys(ids + generated))  # file-level runners: one entry per file
     if not targets:
         print("ℹ️  No affected automated tests to execute.")
         return False, []
-    if LOGIN_SETUP and (any(t["auth"] for t in selected) or any(".auth." in g for g in generated)):
-        targets.append(LOGIN_SETUP)  # logged-in project depends on the login setup
-    print(f"🎭 Executing affected tests: {', '.join(targets)}")
-    npx = tool("npx")
+    need_setup = bool(LOGIN_SETUP) and (any(t["auth"] for t in selected) or any(is_auth_spec(g) for g in generated))
+    print(f"🧪 Executing affected tests ({RUNNER['label']}): {', '.join(targets + ([LOGIN_SETUP] if need_setup else []))}")
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    junit = os.path.join(RESULTS_DIR, "e2e-junit.xml")
+    junit = os.path.abspath(os.path.join(RESULTS_DIR, "e2e-junit.xml"))
     if os.path.exists(junit):
         os.remove(junit)  # never parse results left over from an earlier run
-    # Headless by default (playwright.config.ts). The html reporter must never open/serve a report.
-    env = clean_env({"PLAYWRIGHT_JUNIT_OUTPUT_NAME": junit, "PLAYWRIGHT_HTML_OPEN": "never"})
-    env.setdefault("ESHOP_USE_HTTP_ENDPOINTS", "1")
-    if os.getenv("QA_HEADED"):
-        env["PW_HEADED"] = "1"
+    tokens = {"targets": [",".join(targets)] if RUNNER["targets_join"] == "," else targets,
+              "setup": [LOGIN_SETUP] if need_setup else [], "junit": junit, "json": ""}
+    env = clean_env(runner_env("run", tokens, headed=bool(os.getenv("QA_HEADED"))))
+    argv = build_cmd(RUNNER["run_cmd"], **tokens)
     ensure_browsers()
     for attempt in (1, 2):
         ensure_port_free()
-        proc = subprocess.run([npx, "playwright", "test", *targets, "--reporter=line,junit,html"], env=env)
+        proc = subprocess.run(argv, env=env)
         if proc.returncode == 0 or os.path.exists(junit) or attempt == 2:
             break  # passed, or tests really ran and failed
-        print("⚠️  Playwright exited before producing any results (app start-up problem?) - retrying once in 30s...")
+        print(f"⚠️  {RUNNER['label']} exited before producing any results (app start-up problem?) - retrying once in 30s...")
         time.sleep(30)
 
-    rows = []
-    if os.path.exists(junit):
-        for tc in ET.parse(junit).getroot().iter("testcase"):
-            status, msg = "PASS", ""
-            for tag in ("failure", "error"):
-                node = tc.find(tag)
-                if node is not None:
-                    status, msg = "FAIL", (node.get("message") or (node.text or ""))[:150]
-            if tc.find("skipped") is not None:
-                status = "SKIP"
-            rows.append((tc.get("classname", ""), tc.get("name"), status, tc.get("time", ""), msg))
+    rows = parse_junit(junit)
     if proc.returncode != 0 and not rows:
-        rows = [("e2e", "(playwright run)", "FAIL", "", f"playwright exited with {proc.returncode}")]
+        rows = [("e2e", f"({RUNNER['label']} run)", "FAIL", "", f"{RUNNER['label']} exited with {proc.returncode}")]
     return proc.returncode != 0, rows
 
 
@@ -1214,6 +1421,19 @@ def quarantine_generated_tests(generated):
     return held
 
 
+GEN_MARK = os.path.basename(GENERATED_DIR.rstrip("/"))
+
+
+def is_generated_row(row):
+    """Is this result row from a newly generated spec? (JUnit classname is the file path or dotted module path)"""
+    cls = (row[0] or "").replace("\\", "/").replace(".", "/")
+    return GEN_MARK in cls.split("/")
+
+
+def is_setup_row(row):
+    return bool(LOGIN_SETUP) and os.path.basename(LOGIN_SETUP) == (row[0] or "")
+
+
 DECISION_FILE = os.path.join(RESULTS_DIR, "decision.md")
 
 
@@ -1222,10 +1442,10 @@ def build_decision(results, generated, quarantined):
     bad = [r for r in results if r[2] == "FAIL"]
     if not bad:
         return ""
-    new_fail = [r for r in bad if "generated" in (r[0] or "")]
-    old_fail = [r for r in bad if "generated" not in (r[0] or "") and r[0] != "login.setup.ts"]
-    setup_fail = [r for r in bad if r[0] == "login.setup.ts"]
-    first = lambda r: (r[4] or "").strip().splitlines()[0][:200] if (r[4] or "").strip() else "see the Playwright report"
+    new_fail = [r for r in bad if is_generated_row(r)]
+    old_fail = [r for r in bad if not is_generated_row(r) and not is_setup_row(r)]
+    setup_fail = [r for r in bad if is_setup_row(r)]
+    first = lambda r: (r[4] or "").strip().splitlines()[0][:200] if (r[4] or "").strip() else f"see the {RUNNER['label']} report"
     out = ["## ⚠️ Needs your decision", ""]
     if setup_fail:
         out += ["- **Login setup failed**, so no browser test could run. This points to the environment "
@@ -1332,7 +1552,7 @@ def write_report(analysis, static, inventory, selected, generated, results, fail
             "",
         ]
         for path, code in quarantined.items():
-            lines += [f"<details><summary>{path}</summary>", "", "```ts", code.rstrip(), "```", "", "</details>", ""]
+            lines += [f"<details><summary>{path}</summary>", "", f"```{CODE_LANG}", code.rstrip(), "```", "", "</details>", ""]
     if qa_cost:
         pricing = qa_cost.load_pricing(CFG["pricing_file"])
         cost_cfg = CFG["cost"]
@@ -1381,7 +1601,7 @@ def main():
         scen = analysis.get("test_scenarios", [])
         print(f"   {len(scen)} scenarios, {sum(1 for s in scen if s.get('status') == 'missing')} not automated yet")
 
-        print("🤖 Stage 3: Agent 2 automating missing scenarios with Playwright...")
+        print(f"🤖 Stage 3: Agent 2 automating missing scenarios with {RUNNER['label']}...")
         generated = agent_2_automate(analysis, static)
     except (LLMUnavailable, ValueError) as e:  # ValueError covers malformed JSON from the LLM
         llm_error = str(e)
@@ -1395,7 +1615,7 @@ def main():
     decision = build_decision(results, generated, {}) if failed else ""
     if failed and generated:
         bad = [r for r in results if r[2] == "FAIL"]
-        only_new = bool(bad) and all("generated" in (r[0] or "") for r in bad)
+        only_new = bool(bad) and all(is_generated_row(r) for r in bad)
         quarantined = quarantine_generated_tests(generated)
         decision = build_decision(results, generated, quarantined)
         if only_new:

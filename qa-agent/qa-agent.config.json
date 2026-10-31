@@ -3,6 +3,11 @@
 
   "project_name": "eShop",
   "app_port": 5045,
+  "keep_env": ["USERNAME1", "PASSWORD"],
+  "runner": {
+    "preset": "playwright",
+    "env": { "ESHOP_USE_HTTP_ENDPOINTS": "1" }
+  },
   "project_description": ".NET / Aspire reference e-commerce application: Blazor storefront (WebApp, WebAppComponents) backed by microservices (Catalog.API, Basket.API (gRPC + Redis), Ordering.API, Identity.API (login), Webhooks.API, OrderProcessor, PaymentProcessor) communicating over RabbitMQ integration events.",
   "suite_description": "Playwright end-to-end tests (e2e/*.spec.ts) that drive the storefront in a browser, either anonymously or logged in as the seeded user.",
 
